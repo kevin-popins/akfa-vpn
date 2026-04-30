@@ -301,6 +301,47 @@ def test_user_create_triggers_apply_config_for_online_node(client, auth_headers,
     assert calls and "auto.sync" in calls[-1]
 
 
+def test_verified_online_node_gets_default_user_binding_and_config_client(client, auth_headers, db_session, monkeypatch):
+    node_payload = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "Verified apply", "ip_address": "203.0.113.33", "ssh_username": "root", "ssh_password": "secret"},
+    ).json()
+    from app.models import VpnUser, VpsNode
+    from app.services.xray_config import render_server_config
+
+    node = db_session.get(VpsNode, node_payload["id"])
+    node.status = "online"
+    node.install_log = [
+        {"message": "Выполняется команда", "command": "systemctl status xray --no-pager -l", "exit_code": 0},
+        {"message": "Код выхода: 0", "command": "jq empty /usr/local/etc/xray/config.json", "exit_code": 0},
+        {"message": "Код выхода: 0", "command": "ss -tulpn | grep ':443' || true", "exit_code": 0},
+    ]
+    db_session.commit()
+    calls = []
+
+    async def fake_apply(self):
+        calls.append([user.username for user in self.users])
+        return InstallResult(ok=True, logs=[{"message": "applied"}])
+
+    monkeypatch.setattr(XrayInstaller, "apply_config", fake_apply)
+    response = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={"first_name": "Verified", "last_name": "Client", "username": "verified-client"},
+    )
+    assert response.status_code == 200
+    user = response.json()
+    assert user["allowed_node_ids"] == [node.id]
+    assert user["primary_node_id"] == node.id
+    assert calls and "verified-client" in calls[-1]
+
+    db_session.expire_all()
+    config = json.loads(render_server_config(db_session.get(VpsNode, node.id), db_session.query(VpnUser).all()))
+    clients = config["inbounds"][0]["settings"]["clients"]
+    assert {"id": user["uuid"], "email": "verified-client", "flow": "xtls-rprx-vision"} in clients
+
+
 def test_user_create_persists_and_reports_apply_failure(client, auth_headers, db_session, monkeypatch):
     node_payload = client.post(
         "/admin/nodes",

@@ -55,6 +55,11 @@ def node_has_installed_xray(node: VpsNode) -> bool:
         "Начата реальная установка Xray" in log_text
         or "Применение конфига Xray" in log_text
         or "systemctl restart" in log_text
+        or "systemctl status" in log_text
+        or "jq empty" in log_text
+        or "ss -tulpn" in log_text
+        or "xray version" in log_text
+        or node.last_config_apply_status == APPLY_SUCCESS
     )
 
 
