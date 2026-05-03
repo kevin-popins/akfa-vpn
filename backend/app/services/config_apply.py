@@ -3,13 +3,14 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.models import NodeStatus, VpnUser, VpsNode
 from app.services.audit import audit
 from app.services.reality import ensure_reality_credentials
 from app.services.ssh_installer import XrayInstaller
 from app.services.xray_config import render_server_config
+from app.services.xray_config import effective_node_ids
 
 
 APPLY_SUCCESS = "success"
@@ -49,6 +50,12 @@ class ConfigApplySummary:
         }
 
 
+class ConfigApplyRequiredError(RuntimeError):
+    def __init__(self, message: str, summary: ConfigApplySummary | None = None) -> None:
+        super().__init__(message)
+        self.summary = summary
+
+
 def node_has_installed_xray(node: VpsNode) -> bool:
     if getattr(node, "xray_installed", False):
         return True
@@ -78,8 +85,9 @@ class ConfigApplyService:
         include_uninstalled: bool = False,
         allow_non_online: bool = False,
     ) -> ConfigApplySummary:
+        self.db.flush()
         nodes = self._target_nodes(set(node_ids) if node_ids is not None else None, include_uninstalled)
-        users = list(self.db.scalars(select(VpnUser)))
+        users = self._fresh_users()
         results: list[NodeApplyResult] = []
         for node in nodes:
             results.append(await self._apply_node(node, users, reason, allow_non_online))
@@ -102,14 +110,19 @@ class ConfigApplyService:
             if not node_ids:
                 return []
             query = query.where(VpsNode.id.in_(node_ids))
-        nodes = list(self.db.scalars(query))
-        if include_uninstalled:
-            return nodes
-        return [
-            node
-            for node in nodes
-            if node.status == NodeStatus.online.value and node_has_installed_xray(node)
-        ]
+        return list(self.db.scalars(query))
+
+    def _fresh_users(self) -> list[VpnUser]:
+        self.db.expire_all()
+        return list(
+            self.db.scalars(
+                select(VpnUser).options(
+                    selectinload(VpnUser.devices),
+                    selectinload(VpnUser.node_links),
+                    selectinload(VpnUser.access_profile),
+                )
+            )
+        )
 
     async def _apply_node(self, node: VpsNode, users: list[VpnUser], reason: str, allow_non_online: bool) -> NodeApplyResult:
         if node.status != NodeStatus.online.value and not allow_non_online:
@@ -204,3 +217,31 @@ def last_error_from_logs(logs: list[dict]) -> str | None:
                 parts.append(str(entry["stderr"]))
             return ": ".join(part for part in parts if part)
     return None
+
+
+def affected_node_ids_for_user(user: VpnUser) -> set[int]:
+    return effective_node_ids(user)
+
+
+async def apply_config_for_user(
+    db: Session,
+    user: VpnUser,
+    *,
+    reason: str,
+    admin_id: int | None = None,
+    require_success: bool = False,
+) -> ConfigApplySummary:
+    db.flush()
+    try:
+        db.expire(user, ["devices", "node_links", "access_profile"])
+    except Exception:
+        pass
+    node_ids = affected_node_ids_for_user(user)
+    if not node_ids:
+        raise ConfigApplyRequiredError("Пользователю не назначен сервер")
+    summary = await ConfigApplyService(db, admin_id).apply_to_nodes(node_ids, reason=reason)
+    if require_success:
+        missing = len(node_ids) - summary.succeeded
+        if missing > 0 or summary.failed or summary.skipped:
+            raise ConfigApplyRequiredError("Не удалось применить конфигурацию на сервер", summary)
+    return summary

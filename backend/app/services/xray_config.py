@@ -180,8 +180,16 @@ def server_blocked_domain_rules(users: list[VpnUser], node: VpsNode) -> list[dic
 
 
 def user_allowed_on_node(user: VpnUser, node: VpsNode) -> bool:
-    allowed_ids = set(user.allowed_node_ids or [])
-    return not allowed_ids or node.id in allowed_ids
+    allowed_ids = effective_node_ids(user)
+    return node.id in allowed_ids
+
+
+def effective_node_ids(user: VpnUser) -> set[int]:
+    explicit_ids = set(user.allowed_node_ids or [])
+    if explicit_ids:
+        return explicit_ids
+    profile_ids = set((user.access_profile.allowed_nodes or []) if user.access_profile else [])
+    return profile_ids
 
 
 def torrent_block_rule(outbound_tag: str = "block") -> dict[str, Any]:
@@ -252,11 +260,11 @@ def vless_uri(node: VpsNode, device: VpnUserDevice, remark: str | None = None) -
 
 
 def ordered_available_nodes(user: VpnUser, nodes: list[VpsNode]) -> list[VpsNode]:
-    allowed_ids = set(user.allowed_node_ids or [])
+    allowed_ids = effective_node_ids(user)
     available = [
         node
         for node in nodes
-        if (not allowed_ids or node.id in allowed_ids) and node.status == NodeStatus.online.value
+        if node.id in allowed_ids and node.status == NodeStatus.online.value
     ]
     available.sort(key=lambda node: (0 if user.primary_node_id and node.id == user.primary_node_id else 1, node.location or node.name, node.id))
     return available

@@ -1,5 +1,6 @@
 import csv
 import io
+import logging
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -59,7 +60,13 @@ from app.services.access_profiles import seed_default_access_profiles
 from app.services.reality import check_sni_target, ensure_reality_credentials
 from app.services.audit import audit
 from app.services.backup import build_backup_archive, restore_backup_archive
-from app.services.config_apply import ConfigApplyService, ConfigApplySummary
+from app.services.config_apply import (
+    ConfigApplyRequiredError,
+    ConfigApplyService,
+    ConfigApplySummary,
+    affected_node_ids_for_user,
+    apply_config_for_user,
+)
 from app.services.server_metrics import collect_nodes_metrics
 from app.services.ssh_installer import XrayInstaller
 from app.services.hwid import apply_device_metadata, build_display_name, compute_hwid_context
@@ -75,6 +82,7 @@ from app.services.xray_probe import import_probe_to_node, probe_xray
 router = APIRouter(prefix="/admin", tags=["admin"])
 public_router = APIRouter(tags=["subscriptions"])
 ModelT = TypeVar("ModelT")
+logger = logging.getLogger(__name__)
 
 
 def _get_or_404(db: Session, model: type[ModelT], item_id: int) -> ModelT:
@@ -374,8 +382,10 @@ async def import_existing_xray(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     audit(db, "import_xray", "vps_node", node.id, admin.id)
+    db.flush()
+    summary = await auto_apply_after_change(db, admin, {node.id}, "auto_apply_after_xray_import")
     db.commit()
-    return node
+    return attach_apply_status(node, summary)
 
 
 @router.post("/nodes/{node_id}/apply-config", response_model=NodeRead)
@@ -807,13 +817,22 @@ def _plain_forbidden(message: str, extra_headers: dict[str, str] | None = None) 
     return Response(message, status_code=403, media_type="text/plain; charset=utf-8", headers=_hwid_headers(extra_headers))
 
 
+def _plain_error(message: str, status_code: int, extra_headers: dict[str, str] | None = None) -> Response:
+    return Response(message, status_code=status_code, media_type="text/plain; charset=utf-8", headers=_hwid_headers(extra_headers))
+
+
 def _touch_device_from_context(device: VpnUserDevice, context, db: Session) -> None:
     apply_device_metadata(device, context, created=False)
     db.flush()
 
 
-async def _apply_for_subscription(db: Session, user: VpnUser) -> None:
-    await ConfigApplyService(db).apply_to_nodes(set(user.allowed_node_ids or []), reason="auto_apply_after_hwid_device_change")
+async def _apply_for_subscription(db: Session, user: VpnUser) -> ConfigApplySummary:
+    return await apply_config_for_user(
+        db,
+        user,
+        reason="auto_apply_after_hwid_device_change",
+        require_success=True,
+    )
 
 
 @public_router.get("/public/connect/{user_token}", response_model=PublicConnectRead)
@@ -898,9 +917,12 @@ async def subscription(
         response.headers["x-hwid-active"] = "true"
         return response
 
-    db.expire(user, ["devices"])
+    db.expire(user, ["devices", "node_links", "access_profile"])
     if user.active_devices_count >= user.device_limit:
         return _plain_forbidden("Превышен лимит устройств", {"x-hwid-max-devices-reached": "true"})
+    affected_node_ids = affected_node_ids_for_user(user)
+    if not affected_node_ids:
+        return _plain_forbidden("Пользователю не назначен сервер")
 
     device = VpnUserDevice(
         vpn_user_id=user.id,
@@ -919,7 +941,21 @@ async def subscription(
             client_name=device.client_name,
             device_id=device.id,
         )
-    await _apply_for_subscription(db, user)
+    try:
+        await _apply_for_subscription(db, user)
+    except ConfigApplyRequiredError as exc:
+        summary = exc.summary.as_dict() if exc.summary else None
+        user_id = user.id
+        db.rollback()
+        logger.error(
+            "Subscription config apply failed for vpn_user_id=%s nodes=%s summary=%s",
+            user_id,
+            sorted(affected_node_ids),
+            summary,
+        )
+        if str(exc) == "Пользователю не назначен сервер":
+            return _plain_forbidden("Пользователю не назначен сервер")
+        return _plain_error("Не удалось применить конфигурацию на сервер", status.HTTP_503_SERVICE_UNAVAILABLE)
     db.commit()
     response = subscription_response(db, user, device, format)
     response.headers["x-hwid-limit"] = "true"

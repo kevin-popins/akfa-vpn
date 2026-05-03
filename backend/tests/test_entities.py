@@ -375,7 +375,7 @@ def test_user_create_persists_and_reports_apply_failure(client, auth_headers, db
     assert db_session.query(VpnUser).filter_by(username="bad.sync").first() is not None
 
 
-def test_node_update_keeps_subscription_token_and_changes_vless_params(client, auth_headers, db_session):
+def test_node_update_keeps_subscription_token_and_changes_vless_params(client, auth_headers, db_session, monkeypatch):
     from app.models import VpsNode
 
     node_payload = client.post(
@@ -388,7 +388,13 @@ def test_node_update_keeps_subscription_token_and_changes_vless_params(client, a
     node.reality_public_key = "public"
     node.reality_private_key = "private"
     node.short_id = "abcdef1234567890"
+    node.xray_installed = True
     db_session.commit()
+
+    async def fake_apply(self):
+        return InstallResult(ok=True, logs=[{"message": "applied"}])
+
+    monkeypatch.setattr(XrayInstaller, "apply_config", fake_apply)
     user = client.post(
         "/admin/users",
         headers=auth_headers,

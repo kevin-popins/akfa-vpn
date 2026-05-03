@@ -1,8 +1,30 @@
 import json
 import base64
+import pytest
 from urllib.parse import parse_qs, urlparse
 
 from app.models import VpnUserDevice, VpsNode
+from app.services.ssh_installer import InstallResult, XrayInstaller
+from app.services.xray_config import render_server_config
+
+
+@pytest.fixture(autouse=True)
+def fake_xray_apply(monkeypatch):
+    calls = []
+
+    async def fake_apply(self):
+        calls.append(
+            {
+                "node_id": self.node.id,
+                "users": [user.username for user in self.users],
+                "config": render_server_config(self.node, self.users),
+            }
+        )
+        return InstallResult(ok=True, logs=[{"message": "applied"}])
+
+    monkeypatch.setattr(XrayInstaller, "apply_config", fake_apply)
+    monkeypatch.setattr("app.services.config_apply.node_has_installed_xray", lambda node: True)
+    return calls
 
 
 def test_config_preview_contains_required_reality_fields(client, auth_headers):
@@ -53,7 +75,7 @@ def test_subscription_fails_safely_for_disabled_user(client, auth_headers):
     assert response.status_code == 404
 
 
-def test_hwid_hard_mode_requires_hwid_and_enforces_device_limit(client, auth_headers, db_session):
+def test_hwid_hard_mode_requires_hwid_and_enforces_device_limit(client, auth_headers, db_session, fake_xray_apply):
     node_payload = client.post(
         "/admin/nodes",
         headers=auth_headers,
@@ -79,10 +101,16 @@ def test_hwid_hard_mode_requires_hwid_and_enforces_device_limit(client, auth_hea
 
     first = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "phone-1", "x-device-model": "Pixel 8", "x-device-os": "Android"})
     assert first.status_code == 200
+    first_device = db_session.query(VpnUserDevice).filter_by(vpn_user_id=user["id"]).one()
+    applied_config = json.loads(fake_xray_apply[-1]["config"])
+    assert applied_config["inbounds"][0]["settings"]["clients"][0]["id"] == first_device.uuid
+    assert applied_config["inbounds"][0]["settings"]["clients"][0]["email"] == f"akfa_user_{user['id']}_device_{first_device.id}"
     second = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "phone-2"})
     assert second.status_code == 200
+    apply_count_after_create = len(fake_xray_apply)
     repeat = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "phone-1", "x-real-ip": "198.51.100.10"})
     assert repeat.status_code == 200
+    assert len(fake_xray_apply) == apply_count_after_create
     assert db_session.query(VpnUserDevice).filter_by(vpn_user_id=user["id"], status="active").count() == 2
 
     third = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "phone-3"})
@@ -90,6 +118,74 @@ def test_hwid_hard_mode_requires_hwid_and_enforces_device_limit(client, auth_hea
     assert third.text == "Превышен лимит устройств"
     assert third.headers["x-hwid-max-devices-reached"] == "true"
     assert db_session.query(VpnUserDevice).filter_by(vpn_user_id=user["id"], status="active").count() == 2
+
+
+def test_new_hwid_subscription_requires_assigned_node_and_successful_apply(client, auth_headers, db_session, monkeypatch):
+    no_node_user = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={"first_name": "No", "last_name": "Node", "username": "no-node"},
+    ).json()
+    no_node = client.get(f"/sub/{no_node_user['subscription_token']}", headers={"x-hwid": "lonely-phone"})
+    assert no_node.status_code == 403
+    assert no_node.text == "Пользователю не назначен сервер"
+    assert db_session.query(VpnUserDevice).filter_by(vpn_user_id=no_node_user["id"]).count() == 0
+
+    node_payload = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "Apply failure", "ip_address": "203.0.113.92", "ssh_username": "root", "ssh_password": "secret"},
+    ).json()
+    node = db_session.get(VpsNode, node_payload["id"])
+    node.status = "online"
+    db_session.commit()
+    failing_user = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={"first_name": "Fail", "last_name": "Apply", "username": "fail-apply"},
+    ).json()
+
+    async def failed_apply(self):
+        return InstallResult(ok=False, logs=[{"level": "error", "message": "failed"}])
+
+    monkeypatch.setattr(XrayInstaller, "apply_config", failed_apply)
+    failed = client.get(f"/sub/{failing_user['subscription_token']}", headers={"x-hwid": "apply-fail-phone"})
+    assert failed.status_code == 503
+    assert failed.text == "Не удалось применить конфигурацию на сервер"
+    assert db_session.query(VpnUserDevice).filter_by(vpn_user_id=failing_user["id"]).count() == 0
+
+
+def test_device_revoke_and_reset_auto_apply_remove_hwid_clients(client, auth_headers, db_session, fake_xray_apply):
+    node_payload = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "Revoke apply", "ip_address": "203.0.113.93", "ssh_username": "root", "ssh_password": "secret"},
+    ).json()
+    node = db_session.get(VpsNode, node_payload["id"])
+    node.status = "online"
+    db_session.commit()
+    user = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={"first_name": "Revoke", "last_name": "Device", "username": "revoke-device"},
+    ).json()
+    created = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "revoke-phone"})
+    assert created.status_code == 200
+    device = db_session.query(VpnUserDevice).filter_by(vpn_user_id=user["id"]).one()
+    assert device.uuid in fake_xray_apply[-1]["config"]
+
+    revoked = client.post(f"/admin/users/{user['id']}/devices/{device.id}/revoke", headers=auth_headers)
+    assert revoked.status_code == 200
+    assert device.uuid not in fake_xray_apply[-1]["config"]
+
+    second = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "revoke-phone-2"})
+    assert second.status_code == 200
+    second_device = db_session.query(VpnUserDevice).filter_by(vpn_user_id=user["id"], status="active").one()
+    assert second_device.uuid in fake_xray_apply[-1]["config"]
+
+    reset = client.post(f"/admin/users/{user['id']}/devices/reset", headers=auth_headers)
+    assert reset.status_code == 200
+    assert second_device.uuid not in fake_xray_apply[-1]["config"]
 
 
 def test_device_subscription_requires_matching_hwid_and_clash_is_yaml(client, auth_headers, db_session):
@@ -503,6 +599,14 @@ def test_subscription_reflects_blocked_domain_changes_without_token_change(clien
 
 
 def test_server_config_contains_per_user_blocked_domains(client, auth_headers, db_session):
+    node = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "Server Block", "ip_address": "203.0.113.32", "ssh_username": "root", "ssh_password": "secret"},
+    ).json()
+    db_node = db_session.get(VpsNode, node["id"])
+    db_node.status = "online"
+    db_session.commit()
     profile = client.post(
         "/admin/access-profiles",
         headers=auth_headers,
@@ -511,12 +615,14 @@ def test_server_config_contains_per_user_blocked_domains(client, auth_headers, d
     user = client.post(
         "/admin/users",
         headers=auth_headers,
-        json={"first_name": "Server", "last_name": "Block", "username": "server-block", "access_profile_id": profile["id"]},
-    ).json()
-    node = client.post(
-        "/admin/nodes",
-        headers=auth_headers,
-        json={"name": "Server Block", "ip_address": "203.0.113.32", "ssh_username": "root", "ssh_password": "secret"},
+        json={
+            "first_name": "Server",
+            "last_name": "Block",
+            "username": "server-block",
+            "access_profile_id": profile["id"],
+            "allowed_node_ids": [node["id"]],
+            "primary_node_id": node["id"],
+        },
     ).json()
     client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "server-block-phone"})
     db_session.expire_all()
