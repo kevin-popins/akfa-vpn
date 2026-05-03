@@ -23,6 +23,10 @@ export type NodeRead = {
   status: string;
   short_id?: string;
   reality_public_key?: string;
+  xray_installed?: boolean;
+  managed_mode?: string;
+  inbound_tag?: string | null;
+  import_status?: string | null;
   install_log: Array<Record<string, unknown>>;
   last_config_applied_at?: string | null;
   last_config_apply_status?: string;
@@ -80,6 +84,10 @@ export type VpnUser = {
   online_status: string;
   subscription_token: string;
   uuid: string;
+  connect_url?: string | null;
+  device_limit: number;
+  active_devices_count: number;
+  devices_label: string;
   department_id?: number | null;
   access_profile_id?: number | null;
   allowed_node_ids: number[];
@@ -95,6 +103,28 @@ export type VpnUser = {
   created_at: string;
   updated_at: string;
   apply_status?: ConfigApplySummary | null;
+};
+
+export type VpnUserDevice = {
+  id: number;
+  vpn_user_id: number;
+  name?: string | null;
+  display_name?: string | null;
+  uuid: string;
+  status: string;
+  hwid_masked?: string | null;
+  platform?: string | null;
+  client_name?: string | null;
+  device_model?: string | null;
+  os_version?: string | null;
+  app_version?: string | null;
+  user_agent?: string | null;
+  last_ip_address?: string | null;
+  last_subscribed_at?: string | null;
+  upload_bytes: number;
+  download_bytes: number;
+  total_bytes: number;
+  online_status: string;
 };
 
 export type BulkImportResult = {
@@ -157,6 +187,27 @@ export type SshCheckResult = {
   logs: Array<Record<string, string | number | boolean | null>>;
 };
 
+export type XrayProbeResult = {
+  ssh_ok: boolean;
+  xray_installed: boolean;
+  xray_version?: string | null;
+  service_active?: boolean | null;
+  service_enabled?: boolean | null;
+  config_found: boolean;
+  config_valid: boolean;
+  reality_inbound_found: boolean;
+  partial_import_required: boolean;
+  manual_public_key_required: boolean;
+  public_key_missing: boolean;
+  inbound_tag?: string | null;
+  port?: number | null;
+  server_names: string[];
+  short_ids: string[];
+  clients_count: number;
+  public_key?: string | null;
+  logs: Array<Record<string, unknown>>;
+};
+
 export type TrafficUser = {
   id: number;
   username: string;
@@ -172,7 +223,22 @@ export type TrafficUser = {
   last_online_at?: string | null;
   last_traffic_collected_at?: string | null;
   traffic_limit_bytes?: number | null;
+  devices_label: string;
+  active_devices_count: number;
+  device_limit: number;
   collected: boolean;
+};
+
+export type PublicConnect = {
+  display_name: string;
+  status: string;
+  expires_at?: string | null;
+  traffic_limit?: number | null;
+  used_traffic: number;
+  device_limit: number;
+  active_devices_count: number;
+  devices_label: string;
+  devices: VpnUserDevice[];
 };
 
 export type TrafficCollectResult = {
@@ -226,7 +292,7 @@ export const api = {
     localStorage.setItem("akfa_csrf", token);
   },
   login(email: string, password: string) {
-    return request<{ requires_2fa: boolean; csrf_token?: string }>("/auth/login", {
+    return request<{ requires_2fa: boolean; setup_required?: boolean; login_token?: string; csrf_token?: string }>("/auth/login", {
       method: "POST",
       body: JSON.stringify({ email, password })
     });
@@ -234,8 +300,20 @@ export const api = {
   verify2fa(code: string) {
     return request<{ csrf_token?: string }>("/auth/2fa", { method: "POST", body: JSON.stringify({ code }) });
   },
+  verify2faToken(loginToken: string, code: string) {
+    return request<{ csrf_token?: string }>("/auth/2fa/verify", { method: "POST", body: JSON.stringify({ login_token: loginToken, code }) });
+  },
   me() {
     return request<{ email: string; role: string }>("/auth/me");
+  },
+  startTotpSetup(loginToken?: string) {
+    return request<{ secret: string; otpauth_url: string }>("/auth/2fa/setup/start", { method: "POST", body: JSON.stringify({ login_token: loginToken || null }) });
+  },
+  confirmTotpSetup(loginToken: string | null, code: string) {
+    return request<{ csrf_token?: string }>("/auth/2fa/setup/confirm", { method: "POST", body: JSON.stringify({ login_token: loginToken, code }) });
+  },
+  disableTotp(password: string) {
+    return request<{ email: string; role: string; totp_enabled: boolean }>("/auth/2fa/disable", { method: "POST", body: JSON.stringify({ password }) });
   },
   dashboard() {
     return request<DashboardStats>("/admin/dashboard");
@@ -263,6 +341,15 @@ export const api = {
   },
   checkSsh(payload: Record<string, unknown>) {
     return request<SshCheckResult>("/admin/tools/check-ssh", { method: "POST", body: JSON.stringify(payload) });
+  },
+  probeNode(payload: Record<string, unknown>) {
+    return request<XrayProbeResult>("/admin/nodes/probe", { method: "POST", body: JSON.stringify(payload) });
+  },
+  probeExistingNode(id: number) {
+    return request<XrayProbeResult>(`/admin/nodes/${id}/probe`, { method: "POST" });
+  },
+  importXray(id: number, payload: Record<string, unknown>) {
+    return request<NodeRead>(`/admin/nodes/${id}/import-xray`, { method: "POST", body: JSON.stringify(payload) });
   },
   checkSni(sni: string) {
     return request<SniCheckResult>("/admin/tools/check-sni", { method: "POST", body: JSON.stringify({ sni }) });
@@ -297,11 +384,23 @@ export const api = {
   users() {
     return request<VpnUser[]>("/admin/users");
   },
+  publicConnect(token: string) {
+    return request<PublicConnect>(`/public/connect/${token}`);
+  },
   createUser(payload: Record<string, unknown>) {
     return request<VpnUser>("/admin/users", { method: "POST", body: JSON.stringify(payload) });
   },
   updateUser(id: number, payload: Record<string, unknown>) {
     return request<VpnUser>(`/admin/users/${id}`, { method: "PUT", body: JSON.stringify(payload) });
+  },
+  userDevices(id: number) {
+    return request<VpnUserDevice[]>(`/admin/users/${id}/devices`);
+  },
+  revokeDevice(userId: number, deviceId: number) {
+    return request<VpnUserDevice>(`/admin/users/${userId}/devices/${deviceId}/revoke`, { method: "POST" });
+  },
+  resetDevices(userId: number) {
+    return request<VpnUserDevice[]>(`/admin/users/${userId}/devices/reset`, { method: "POST" });
   },
   deleteUser(id: number) {
     return request<{ message: string; diagnostics?: string; apply_status?: ConfigApplySummary | null }>(`/admin/users/${id}`, { method: "DELETE" });

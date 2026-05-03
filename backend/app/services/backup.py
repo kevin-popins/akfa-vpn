@@ -16,6 +16,7 @@ from app.models import (
     TrafficSnapshot,
     UserNodeTraffic,
     VpnUser,
+    VpnUserDevice,
     VpnUserNode,
     VpsNode,
 )
@@ -30,6 +31,7 @@ EXPORT_MODELS = [
     Department,
     VpsNode,
     VpnUser,
+    VpnUserDevice,
     VpnUserNode,
     UserNodeTraffic,
     TrafficSnapshot,
@@ -42,6 +44,7 @@ EXPORT_FILES = {
     "departments": Department,
     "nodes": VpsNode,
     "users": VpnUser,
+    "devices": VpnUserDevice,
     "user_nodes": VpnUserNode,
     "user_node_traffic": UserNodeTraffic,
     "traffic_snapshots": TrafficSnapshot,

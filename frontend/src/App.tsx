@@ -27,10 +27,10 @@ import { Button } from "./components/ui/button";
 import { Card, CardContent, CardHeader } from "./components/ui/card";
 import { Field, Input, Select, Textarea } from "./components/ui/input";
 import { StatusBadge, Table } from "./components/ui/table";
-import { api, type AccessProfile, type ConfigApplySummary, type DashboardStats, type Department, type NodeMetric, type NodeRead, type SniCheckResult, type SshCheckResult, type SubscriptionVlessUri, type TrafficUser, type VpnUser } from "./lib/api";
+import { api, type AccessProfile, type ConfigApplySummary, type DashboardStats, type Department, type NodeMetric, type NodeRead, type PublicConnect, type SniCheckResult, type SshCheckResult, type SubscriptionVlessUri, type TrafficUser, type VpnUser, type VpnUserDevice, type XrayProbeResult } from "./lib/api";
 import { formatBytes } from "./lib/utils";
 
-type SessionState = "checking" | "login" | "totp" | "ready";
+type SessionState = "checking" | "login" | "totp" | "setup" | "ready";
 type NodeAction = "check" | "dry-run" | "install" | "verify" | "apply-config";
 type PreviewBlock = { label: string; value: string; mono?: boolean };
 type PreviewState = { title: string; empty: string; blocks: PreviewBlock[] };
@@ -89,6 +89,7 @@ const defaultUserForm = {
   username: "",
   department_id: "",
   access_profile_id: "",
+  device_limit: "5",
   traffic_limit_gb: "",
   expires_at: "",
   status: "active",
@@ -100,20 +101,24 @@ function App() {
   const [session, setSession] = useState<SessionState>("checking");
   const [page, setPage] = useState<PageKey>("dashboard");
   const [notice, setNotice] = useState("");
+  const publicToken = publicConnectToken();
 
   useEffect(() => {
+    if (publicToken) return;
     api
       .me()
       .then(() => setSession("ready"))
       .catch(() => setSession("login"));
-  }, []);
+  }, [publicToken]);
 
+  if (publicToken) return <PublicConnectPage userToken={publicToken} />;
   if (session === "checking") return <Splash />;
-  if (session === "login" || session === "totp") {
+  if (session === "login" || session === "totp" || session === "setup") {
     return (
       <LoginPage
         mode={session}
         onTotp={() => setSession("totp")}
+        onSetup={() => setSession("setup")}
         onReady={() => setSession("ready")}
         onNotice={setNotice}
         notice={notice}
@@ -132,15 +137,113 @@ function Splash() {
   return <div className="grid min-h-screen place-items-center text-sm text-akfa-muted">AKFA</div>;
 }
 
+function PublicConnectPage({ userToken }: { userToken: string }) {
+  const [data, setData] = useState<PublicConnect | null>(null);
+  const [selected, setSelected] = useState("android-happ");
+  const [notice, setNotice] = useState("");
+
+  useEffect(() => {
+    api
+      .publicConnect(userToken)
+      .then(setData)
+      .catch((error) => setNotice(error instanceof Error ? error.message : "Подключение недоступно"));
+  }, [userToken]);
+
+  const options = connectOptions(userToken);
+  const current = options.find((item) => item.id === selected) || options[0];
+  const limitReached = data ? data.active_devices_count >= data.device_limit : false;
+
+  async function copyLink(value: string) {
+    await navigator.clipboard.writeText(value);
+    setNotice("Ссылка скопирована");
+  }
+
+  return (
+    <div className="min-h-screen bg-white px-4 py-8 text-akfa-text">
+      <main className="mx-auto grid max-w-5xl gap-6">
+        <header className="flex flex-wrap items-center justify-between gap-3 border-b border-akfa-line pb-4">
+          <div>
+            <div className="text-sm font-semibold text-akfa-red">AKFA VPN</div>
+            <h1 className="text-2xl font-semibold">На какое устройство хотите подключить VPN?</h1>
+          </div>
+          {data ? <div className="rounded-md border border-akfa-line px-3 py-2 text-sm">Устройства: <b>{data.devices_label}</b></div> : null}
+        </header>
+        {notice ? <Message tone={notice.includes("скопирована") ? "success" : "error"} text={notice} /> : null}
+        {data ? (
+          <section className="grid gap-2 text-sm md:grid-cols-4">
+            <Line k="Пользователь" v={data.display_name} />
+            <Line k="Статус" v={translateStatus(data.status)} />
+            <Line k="Срок" v={data.expires_at ? formatDate(data.expires_at) : "Без срока"} />
+            <Line k="Трафик" v={`${formatBytes(data.used_traffic)}${data.traffic_limit ? ` / ${formatBytes(data.traffic_limit)}` : ""}`} />
+          </section>
+        ) : null}
+        <Message tone="warning" text="Ограничение устройств работает только с клиентами, которые передают HWID. Если приложение не поддерживает HWID, подписка не будет выдана." />
+        {limitReached ? <Message tone="warning" text="Лимит устройств исчерпан. Новое устройство не сможет получить конфиг." /> : null}
+        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          {options.map((option) => (
+            <button
+              key={option.id}
+              className={`rounded-md border p-4 text-left transition ${selected === option.id ? "border-akfa-red bg-red-50" : "border-akfa-line hover:border-akfa-red/50"}`}
+              onClick={() => setSelected(option.id)}
+            >
+              <div className="font-semibold">{option.title}</div>
+              <div className="mt-1 text-sm text-akfa-muted">{option.client}</div>
+            </button>
+          ))}
+        </section>
+        <Card>
+          <CardHeader>
+            <h2 className="font-semibold">{current.title}: {current.client}</h2>
+            <p className="mt-1 text-sm text-akfa-muted">Не копируйте ссылку одного устройства на другое. Для нового устройства откройте эту страницу заново на нужной платформе.</p>
+          </CardHeader>
+          <CardContent className="grid gap-4 lg:grid-cols-[1fr_220px]">
+            <div className="grid gap-3">
+              <Field label="Ссылка подписки">
+                <div className="flex gap-2">
+                  <Input readOnly value={absoluteUrl(current.path)} />
+                  <Button variant="secondary" onClick={() => copyLink(absoluteUrl(current.path))}><Copy size={16} />Копировать</Button>
+                </div>
+              </Field>
+              <ol className="list-decimal space-y-2 pl-5 text-sm text-akfa-muted">
+                {current.steps.map((step) => <li key={step}>{step}</li>)}
+              </ol>
+            </div>
+            <div className="grid place-items-center rounded-md border border-akfa-line p-4">
+              <QRCodeCanvas value={absoluteUrl(current.path)} size={180} />
+            </div>
+          </CardContent>
+        </Card>
+        {data?.devices.length ? (
+          <Card>
+            <CardHeader><h2 className="font-semibold">Устройства</h2></CardHeader>
+            <CardContent className="grid gap-2">
+              {data.devices.map((device) => (
+                <div key={device.id} className="grid gap-1 rounded-md border border-akfa-line p-3 text-sm md:grid-cols-4">
+                  <Line k="Название" v={device.display_name || `DEV-${device.id}`} />
+                  <Line k="Платформа" v={device.platform || "-"} />
+                  <Line k="Клиент" v={device.client_name || "-"} />
+                  <Line k="HWID" v={device.hwid_masked || "-"} />
+                </div>
+              ))}
+            </CardContent>
+          </Card>
+        ) : null}
+      </main>
+    </div>
+  );
+}
+
 function LoginPage({
   mode,
   onTotp,
+  onSetup,
   onReady,
   onNotice,
   notice
 }: {
   mode: SessionState;
   onTotp: () => void;
+  onSetup: () => void;
   onReady: () => void;
   onNotice: (value: string) => void;
   notice: string;
@@ -148,19 +251,33 @@ function LoginPage({
   const [email, setEmail] = useState("admin@example.com");
   const [password, setPassword] = useState("");
   const [code, setCode] = useState("");
+  const [loginToken, setLoginToken] = useState("");
+  const [setup, setSetup] = useState<{ secret: string; otpauth_url: string } | null>(null);
   const [loading, setLoading] = useState(false);
 
   async function submit() {
     setLoading(true);
     try {
+      if (mode === "setup") {
+        const response = await api.confirmTotpSetup(loginToken, code);
+        if (response.csrf_token) api.setCsrf(response.csrf_token);
+        onReady();
+        return;
+      }
       if (mode === "totp") {
-        const response = await api.verify2fa(code);
+        const response = loginToken ? await api.verify2faToken(loginToken, code) : await api.verify2fa(code);
         if (response.csrf_token) api.setCsrf(response.csrf_token);
         onReady();
         return;
       }
       const response = await api.login(email, password);
+      if (response.login_token) setLoginToken(response.login_token);
       if (response.requires_2fa) onTotp();
+      if (response.setup_required && response.login_token) {
+        const setupResponse = await api.startTotpSetup(response.login_token);
+        setSetup(setupResponse);
+        onSetup();
+      }
       if (response.csrf_token) {
         api.setCsrf(response.csrf_token);
         onReady();
@@ -186,7 +303,16 @@ function LoginPage({
         </CardHeader>
         <CardContent className="grid gap-4">
           {notice ? <Message tone="error" text={notice} /> : null}
-          {mode === "totp" ? (
+          {mode === "setup" ? (
+            <>
+              <p className="text-sm text-akfa-muted">Отсканируйте QR-код в Google Authenticator или другом приложении для одноразовых кодов.</p>
+              {setup ? <div className="grid place-items-center"><QRCodeCanvas value={setup.otpauth_url} size={180} /></div> : null}
+              {setup ? <Field label="Secret"><Input readOnly value={setup.secret} /></Field> : null}
+              <Field label="Введите 6-значный код">
+                <Input value={code} onChange={(event) => setCode(event.target.value)} inputMode="numeric" autoFocus />
+              </Field>
+            </>
+          ) : mode === "totp" ? (
             <Field label="Код 2FA" hint="Введите одноразовый код из приложения аутентификации.">
               <Input value={code} onChange={(event) => setCode(event.target.value)} inputMode="numeric" autoFocus />
             </Field>
@@ -202,7 +328,7 @@ function LoginPage({
           )}
           <Button onClick={submit} disabled={loading}>
             <CheckCircle2 size={16} />
-            {loading ? "Проверка..." : "Войти"}
+            {loading ? "Проверка..." : mode === "setup" ? "Подтвердить" : "Войти"}
           </Button>
         </CardContent>
       </Card>
@@ -844,11 +970,13 @@ function AddServerPage({
   const [form, setForm] = useState<Record<string, string | number>>(emptyNode);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [showPassword, setShowPassword] = useState(false);
-  const [loading, setLoading] = useState<"save" | "check" | "sni" | null>(null);
+  const [loading, setLoading] = useState<"save" | "check" | "sni" | "probe" | "import" | null>(null);
   const [success, setSuccess] = useState("");
   const [sniMode, setSniMode] = useState("preset");
   const [sniResult, setSniResult] = useState<SniCheckResult | null>(null);
   const [sshResult, setSshResult] = useState<SshCheckResult | null>(null);
+  const [probeResult, setProbeResult] = useState<XrayProbeResult | null>(null);
+  const [manualPublicKey, setManualPublicKey] = useState("");
   const [savedNode, setSavedNode] = useState<NodeRead | null>(null);
 
   function update(key: string, value: string | number) {
@@ -856,6 +984,7 @@ function AddServerPage({
     setErrors({ ...errors, [key]: "" });
     setSuccess("");
     setSshResult(null);
+    setProbeResult(null);
     setSavedNode(null);
     if (key === "sni") setSniResult(null);
   }
@@ -913,6 +1042,41 @@ function AddServerPage({
     }
   }
 
+  async function probe() {
+    if (!validate()) return;
+    setLoading("probe");
+    setProbeResult(null);
+    try {
+      const result = await api.probeNode(form);
+      setProbeResult(result);
+      setSuccess(result.reality_inbound_found ? "Reality inbound найден" : "Проверка завершена");
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "Проверка сервера не выполнена");
+    } finally {
+      setLoading(null);
+    }
+  }
+
+  async function importExisting() {
+    if (!probeResult) return;
+    if ((probeResult.manual_public_key_required || probeResult.public_key_missing || probeResult.partial_import_required) && !manualPublicKey.trim()) {
+      onNotice("Введите Reality publicKey для импорта");
+      return;
+    }
+    setLoading("import");
+    try {
+      const node = savedNode || await api.createNode(form);
+      const imported = await api.importXray(node.id, { probe: probeResult, public_key: manualPublicKey.trim() || null });
+      setSavedNode(imported);
+      onCreated(imported);
+      setSuccess("Существующий Xray импортирован");
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "Импорт Xray не выполнен");
+    } finally {
+      setLoading(null);
+    }
+  }
+
   async function checkSni() {
     const sniError = validateSniValue(String(form.sni));
     setErrors({ ...errors, sni: sniError });
@@ -943,6 +1107,15 @@ function AddServerPage({
             </div>
           ) : null}
           {sshResult ? <SshCheckPanel result={sshResult} /> : null}
+          {probeResult ? (
+            <ProbePanel
+              result={probeResult}
+              manualPublicKey={manualPublicKey}
+              onManualPublicKey={setManualPublicKey}
+              onImport={importExisting}
+              importing={loading === "import"}
+            />
+          ) : null}
           <div className="grid gap-4 md:grid-cols-2">
             <Field label="Название сервера" error={errors.name}>
               <Input value={String(form.name)} onChange={(event) => update("name", event.target.value)} placeholder="Москва-1" />
@@ -1014,6 +1187,10 @@ function AddServerPage({
             <Button variant="secondary" onClick={check} disabled={Boolean(loading)}>
               <ShieldCheck size={16} />
               {loading === "check" ? "Проверяю..." : "Проверить подключение"}
+            </Button>
+            <Button variant="secondary" onClick={probe} disabled={Boolean(loading)}>
+              <ShieldCheck size={16} />
+              {loading === "probe" ? "Проверяю сервер..." : "Проверить сервер"}
             </Button>
             <Button onClick={save} disabled={Boolean(loading)}>
               <Save size={16} />
@@ -1724,6 +1901,9 @@ function UsersPage({
               {profiles.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
             </Select>
           </Field>
+          <Field label="Количество устройств" hint="Лимит активных HWID-устройств.">
+            <Input className="h-9" value={form.device_limit} onChange={(event) => setForm({ ...form, device_limit: event.target.value })} type="number" min={1} max={100} />
+          </Field>
           <Field label="Лимит трафика" hint="ГБ. Если пусто, будет использован лимит профиля.">
             <Input className="h-9" value={form.traffic_limit_gb} onChange={(event) => setForm({ ...form, traffic_limit_gb: event.target.value })} type="number" min={0} step="0.5" />
           </Field>
@@ -1765,13 +1945,14 @@ function UsersTable({
   if (!users.length) return <EmptyPanel title="Ничего не найдено" text="Измените поиск или фильтры." />;
   return (
     <div className="overflow-x-auto rounded-md border border-akfa-line">
-      <Table className="min-w-[860px] table-fixed">
+      <Table className="min-w-[960px] table-fixed">
         <thead className="bg-zinc-50">
           <tr className="border-b border-akfa-line text-xs font-semibold text-akfa-muted">
             <th className="w-[24%] py-2.5 pl-3 pr-4">ФИО</th>
             <th className="w-[15%] px-3">Логин</th>
             <th className="w-[14%] px-3">Отдел</th>
-            <th className="w-[20%] px-3">Профиль</th>
+            <th className="w-[18%] px-3">Профиль</th>
+            <th className="w-[9%] px-3">Устройства</th>
             <th className="w-[10%] px-3">Онлайн</th>
             <th className="w-[9%] px-3 text-right">Трафик</th>
             <th className="w-[8%] px-3 text-right">Действия</th>
@@ -1788,6 +1969,7 @@ function UsersTable({
               </td>
               <td className="px-3 py-2.5"><div className="truncate" title={departmentName(user.department_id, departments) || "-"}>{departmentName(user.department_id, departments) || "-"}</div></td>
               <td className="px-3 py-2.5"><div className="truncate" title={profileName(user.access_profile_id, profiles) || "-"}>{profileName(user.access_profile_id, profiles) || "-"}</div></td>
+              <td className="whitespace-nowrap px-3 py-2.5 font-medium">{user.devices_label || `${user.active_devices_count || 0}/${user.device_limit || 5}`}</td>
               <td className="px-3 py-2.5"><StatusBadge value={user.online_status || "offline"} /></td>
               <td className="whitespace-nowrap px-3 py-2.5 text-right tabular-nums">{formatBytes(user.used_total_bytes)}</td>
               <td className="px-3 py-2">
@@ -1896,6 +2078,7 @@ function UserDetailPage({
 }) {
   const [accessBlocks, setAccessBlocks] = useState<PreviewBlock[]>([]);
   const [vlessEntries, setVlessEntries] = useState<SubscriptionVlessUri[]>([]);
+  const [devices, setDevices] = useState<VpnUserDevice[]>([]);
   const [nodeSelection, setNodeSelection] = useState<{ ids: number[]; primaryId: number | null }>({ ids: [], primaryId: null });
   const [activeTab, setActiveTab] = useState("Ссылка подписки");
   const [confirm, setConfirm] = useState<ConfirmState>(null);
@@ -1904,20 +2087,22 @@ function UserDetailPage({
     if (!user) {
       setAccessBlocks([]);
       setVlessEntries([]);
+      setDevices([]);
       return;
     }
     setNodeSelection({ ids: user.allowed_node_ids || [], primaryId: user.primary_node_id || null });
-    const subscriptionUrl = absoluteUrl(`/sub/${user.subscription_token}`);
-    setAccessBlocks([{ label: "Ссылка подписки", value: subscriptionUrl }]);
+    const connectUrl = absoluteUrl(`/connect/${user.subscription_token}`);
+    setAccessBlocks([{ label: "Connect-ссылка", value: connectUrl }]);
     setVlessEntries([]);
-    setActiveTab("Ссылка подписки");
+    setActiveTab("Connect-ссылка");
+    api.userDevices(user.id).then(setDevices).catch(() => setDevices([]));
     api
       .subscriptionPreview(user.id)
       .then((data) => {
         setVlessEntries(data.vless_uris || []);
         setAccessBlocks(
           [
-            { label: "Ссылка подписки", value: absoluteUrl(data.subscription_url || `/sub/${user.subscription_token}`) },
+            { label: "Connect-ссылка", value: connectUrl },
             { label: "VLESS URI", value: data.vless_uri || "", mono: true },
             { label: "Xray JSON", value: prettyJson(data.xray_json), mono: true },
             { label: "sing-box JSON", value: prettyJson(data.sing_box), mono: true },
@@ -1929,7 +2114,7 @@ function UserDetailPage({
 
   if (!user) return <EmptyPanel title="Пользователь не выбран" text="Откройте список пользователей и выберите доступ для просмотра." />;
 
-  const subscriptionUrl = absoluteUrl(`/sub/${user.subscription_token}`);
+  const subscriptionUrl = absoluteUrl(`/connect/${user.subscription_token}`);
   const tokenMasked = maskToken(user.subscription_token);
   const userId = user.id;
   const currentTab = activeTab === "QR-код" ? null : accessBlocks.find((block) => block.label === activeTab) || accessBlocks[0];
@@ -1961,6 +2146,26 @@ function UserDetailPage({
     onNotice("Ссылка подписки скопирована");
   }
 
+  async function revokeDevice(deviceId: number) {
+    try {
+      await api.revokeDevice(userId, deviceId);
+      setDevices(await api.userDevices(userId));
+      onNotice("Устройство отключено");
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "Устройство не отключено");
+    }
+  }
+
+  async function resetDevices() {
+    try {
+      await api.resetDevices(userId);
+      setDevices(await api.userDevices(userId));
+      onNotice("Устройства сброшены");
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "Устройства не сброшены");
+    }
+  }
+
   async function copyBlock(value: string) {
     await navigator.clipboard.writeText(value);
     onNotice("Скопировано");
@@ -1980,6 +2185,7 @@ function UserDetailPage({
         department_id: user.department_id || null,
         access_profile_id: user.access_profile_id || null,
         traffic_limit_bytes: user.traffic_limit_bytes || null,
+        device_limit: user.device_limit || 5,
         expires_at: user.expires_at || null,
         status: user.status,
         allowed_node_ids: nodeSelection.ids,
@@ -2067,6 +2273,7 @@ function UserDetailPage({
             <Line k="Отправлено" v={formatBytes(user.used_upload_bytes)} />
             <Line k="Получено" v={formatBytes(user.used_download_bytes)} />
             <Line k="Всего" v={formatBytes(user.used_total_bytes)} />
+            <Line k="Устройства" v={user.devices_label || `${user.active_devices_count || 0}/${user.device_limit || 5}`} />
             <Line k="Последний онлайн" v={user.last_online_at ? formatDate(user.last_online_at) : "Не было"} />
             <Line k="Последний сбор" v={user.last_traffic_collected_at ? formatDate(user.last_traffic_collected_at) : "Не выполнялся"} />
             <Line k="Истекает" v={user.expires_at ? formatDate(user.expires_at) : "Без срока"} />
@@ -2092,6 +2299,7 @@ function UserDetailPage({
           <CardHeader><h2 className="font-semibold">Действия</h2></CardHeader>
           <CardContent className="grid gap-2">
           <Button variant="secondary" onClick={copyLink}><Copy size={16} />Скопировать ссылку</Button>
+          <Button variant="secondary" onClick={resetDevices}><RefreshCcw size={16} />Сбросить устройства</Button>
           {user.status === "active" ? (
             <Button variant="secondary" onClick={() => confirmAction("Отключить пользователя?", user.username, "disable", "Пользователь отключен")}><XCircle size={16} />Отключить</Button>
           ) : (
@@ -2104,6 +2312,49 @@ function UserDetailPage({
           </CardContent>
         </Card>
       </div>
+      <Card>
+        <CardHeader><h2 className="font-semibold">Устройства</h2></CardHeader>
+        <CardContent className="grid gap-3">
+          {!devices.length ? (
+            <EmptyPanel title="Устройств пока нет" text="Первое устройство появится после запроса подписки клиентом с x-hwid." />
+          ) : (
+            <div className="overflow-x-auto">
+              <Table className="min-w-[980px]">
+                <thead>
+                  <tr className="border-b border-akfa-line text-akfa-muted">
+                    <th className="py-2">Название</th>
+                    <th>Модель</th>
+                    <th>Платформа</th>
+                    <th>Клиент</th>
+                    <th>HWID</th>
+                    <th>IP</th>
+                    <th>Трафик</th>
+                    <th>Статус</th>
+                    <th className="text-right">Действия</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {devices.map((device) => (
+                    <tr key={device.id} className="border-b border-akfa-line last:border-0">
+                      <td className="py-3 font-medium">{device.display_name || `DEV-${device.id}`}</td>
+                      <td>{device.device_model || "-"}</td>
+                      <td>{[device.platform, device.os_version].filter(Boolean).join(" ") || "-"}</td>
+                      <td>{[device.client_name, device.app_version].filter(Boolean).join(" ") || "-"}</td>
+                      <td className="font-mono text-xs">{device.hwid_masked || "-"}</td>
+                      <td>{device.last_ip_address || "-"}</td>
+                      <td>{formatBytes(device.total_bytes || 0)}</td>
+                      <td><StatusBadge value={device.status} /></td>
+                      <td className="text-right">
+                        {device.status === "active" ? <Button variant="danger" className="h-8" onClick={() => revokeDevice(device.id)}>Отключить</Button> : null}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </Table>
+            </div>
+          )}
+        </CardContent>
+      </Card>
     </div>
     <ConfirmDialog open={Boolean(confirm)} title={confirm?.title || ""} text={confirm?.text || ""} confirmLabel={confirm?.confirmLabel} onCancel={() => setConfirm(null)} onConfirm={() => confirm?.onConfirm()} />
     </>
@@ -2388,7 +2639,7 @@ function TrafficPage({ nodes, rows, onRows }: { nodes: NodeRead[]; rows: Traffic
                     <SortableTh label="Получено" active={sortKey === "download"} direction={sortDirection} onClick={() => changeSort("download")} className="px-3" />
                     <SortableTh label="Всего" active={sortKey === "total"} direction={sortDirection} onClick={() => changeSort("total")} className="px-3" />
                     <SortableTh label="Последний онлайн" active={sortKey === "lastOnline"} direction={sortDirection} onClick={() => changeSort("lastOnline")} className="px-3" />
-                    <th className="px-3 py-3 font-medium">Последний сбор</th>
+                    <th className="px-3 py-3 font-medium">Устройства</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -2403,7 +2654,7 @@ function TrafficPage({ nodes, rows, onRows }: { nodes: NodeRead[]; rows: Traffic
                       <td className="whitespace-nowrap px-3 py-4">{formatBytes(row.download_bytes)}</td>
                       <td className="whitespace-nowrap px-3 py-4 font-medium">{formatBytes(row.total_bytes)}</td>
                       <td className="whitespace-nowrap px-3 py-4">{row.last_online_at ? formatDate(row.last_online_at) : "Не было"}</td>
-                      <td className="whitespace-nowrap px-3 py-4 text-akfa-muted">{row.last_traffic_collected_at ? formatDate(row.last_traffic_collected_at) : row.collected ? "Собрана" : "0 Б, ожидает сбора"}</td>
+                      <td className="whitespace-nowrap px-3 py-4 text-akfa-muted">{row.devices_label || `${row.active_devices_count || 0}/${row.device_limit || 5}`}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -2497,14 +2748,71 @@ function AuditPage({ rows, onRefresh }: { rows: Array<Record<string, unknown>>; 
 }
 
 function SettingsPage() {
+  const [setup, setSetup] = useState<{ secret: string; otpauth_url: string } | null>(null);
+  const [code, setCode] = useState("");
+  const [password, setPassword] = useState("");
+  const [message, setMessage] = useState("");
+
+  async function startSetup() {
+    try {
+      setSetup(await api.startTotpSetup());
+      setMessage("");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "2FA не запущена");
+    }
+  }
+
+  async function confirmSetup() {
+    try {
+      const response = await api.confirmTotpSetup(null, code);
+      if (response.csrf_token) api.setCsrf(response.csrf_token);
+      setMessage("Двухфакторная защита включена");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Код не подтвержден");
+    }
+  }
+
+  async function disable() {
+    try {
+      await api.disableTotp(password);
+      setSetup(null);
+      setMessage("Двухфакторная защита отключена");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "2FA не отключена");
+    }
+  }
+
   return (
     <div className="grid gap-5">
       <PageHeader title="Настройки администратора" description="Текущие механизмы безопасности панели." />
+      {message ? <Message tone={message.includes("не") || message.includes("Невер") ? "error" : "success"} text={message} /> : null}
       <Card>
         <CardContent className="grid gap-3 md:grid-cols-3">
           <StatusBadge value="secure_cookies" />
           <StatusBadge value="totp_2fa" />
           <StatusBadge value="csrf" />
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader><h2 className="font-semibold">Двухфакторная защита</h2></CardHeader>
+        <CardContent className="grid gap-4 md:grid-cols-[1fr_220px]">
+          <div className="grid gap-3">
+            <p className="text-sm text-akfa-muted">Отсканируйте QR-код в Google Authenticator или другом приложении для одноразовых кодов.</p>
+            {setup ? (
+              <>
+                <Field label="Secret для ручного ввода"><Input readOnly value={setup.secret} /></Field>
+                <Field label="Введите 6-значный код"><Input value={code} onChange={(event) => setCode(event.target.value)} inputMode="numeric" /></Field>
+                <Button onClick={confirmSetup}><CheckCircle2 size={16} />Подтвердить</Button>
+              </>
+            ) : (
+              <Button onClick={startSetup}><ShieldCheck size={16} />Включить 2FA</Button>
+            )}
+            <div className="grid gap-2 border-t border-akfa-line pt-3">
+              <Field label="Пароль для отключения"><Input value={password} onChange={(event) => setPassword(event.target.value)} type="password" /></Field>
+              <Button variant="secondary" onClick={disable}>Сбросить 2FA</Button>
+            </div>
+          </div>
+          {setup ? <div className="grid place-items-center rounded-md border border-akfa-line p-4"><QRCodeCanvas value={setup.otpauth_url} size={180} /></div> : null}
         </CardContent>
       </Card>
     </div>
@@ -2680,6 +2988,52 @@ function SshCheckPanel({ result }: { result: SshCheckResult }) {
   );
 }
 
+function ProbePanel({
+  result,
+  manualPublicKey,
+  onManualPublicKey,
+  onImport,
+  importing
+}: {
+  result: XrayProbeResult;
+  manualPublicKey: string;
+  onManualPublicKey: (value: string) => void;
+  onImport: () => void;
+  importing: boolean;
+}) {
+  const needsPublicKey = result.partial_import_required || result.manual_public_key_required || result.public_key_missing;
+  return (
+    <div className="grid gap-3 rounded-md border border-akfa-line bg-white p-3 text-sm">
+      <div className={result.ssh_ok ? "font-semibold text-akfa-green" : "font-semibold text-akfa-red"}>
+        {result.ssh_ok ? "Сервер проверен" : "Проверка не выполнена"}
+      </div>
+      <div className="grid gap-2 md:grid-cols-3">
+        <Line k="SSH" v={result.ssh_ok ? "OK" : "ошибка"} />
+        <Line k="Xray" v={result.xray_installed ? "установлен" : "не установлен"} />
+        <Line k="Service" v={result.service_active ? "active" : "inactive"} />
+        <Line k="Config" v={result.config_found ? result.config_valid ? "валидный" : "невалидный" : "не найден"} />
+        <Line k="Reality inbound" v={result.reality_inbound_found ? "найден" : "не найден"} />
+        <Line k="Port" v={result.port ? String(result.port) : "-"} />
+        <Line k="SNI/serverName" v={result.server_names?.[0] || "-"} />
+        <Line k="ShortId" v={result.short_ids?.[0] || "-"} />
+        <Line k="Clients" v={String(result.clients_count || 0)} />
+      </div>
+      {needsPublicKey ? (
+        <Field label="Reality publicKey" hint="Введите publicKey из команды xray x25519 -i privateKey">
+          <Input value={manualPublicKey} onChange={(event) => onManualPublicKey(event.target.value)} placeholder="Введите publicKey из команды xray x25519 -i privateKey" />
+        </Field>
+      ) : null}
+      {result.xray_installed && result.reality_inbound_found ? (
+        <Button onClick={onImport} disabled={importing || (needsPublicKey && !manualPublicKey.trim())}>
+          <Download size={16} />
+          {importing ? "Импортирую..." : "Импортировать существующий Xray"}
+        </Button>
+      ) : null}
+      {!result.xray_installed ? <Message tone="warning" text="Xray не установлен. Можно сохранить сервер и перейти к установке Xray." /> : null}
+    </div>
+  );
+}
+
 function XrayStatusPanel({ logs, port }: { logs: Array<Record<string, unknown>>; port: number }) {
   const version = findLogOutput(logs, "xray version") || findLogOutput(logs, "/usr/local/bin/xray version");
   const statusLog = findLog(logs, "systemctl status");
@@ -2707,6 +3061,7 @@ function userPayload(form: typeof defaultUserForm) {
     access_profile_id: form.access_profile_id ? Number(form.access_profile_id) : null,
     allowed_node_ids: form.allowed_node_ids,
     primary_node_id: form.primary_node_id ? Number(form.primary_node_id) : null,
+    device_limit: Math.max(1, Number(form.device_limit || 5)),
     traffic_limit_bytes: form.traffic_limit_gb ? Math.round(Number(form.traffic_limit_gb) * 1024 * 1024 * 1024) : null,
     expires_at: form.expires_at ? new Date(form.expires_at).toISOString() : null,
     status: form.status
@@ -2869,6 +3224,51 @@ function absoluteUrl(path: string) {
   if (!path) return "";
   if (path.startsWith("http")) return path;
   return `${window.location.origin}${path.startsWith("/") ? path : `/${path}`}`;
+}
+
+function publicConnectToken() {
+  const match = window.location.pathname.match(/^\/connect\/([^/]+)/);
+  return match ? decodeURIComponent(match[1]) : "";
+}
+
+function connectOptions(token: string) {
+  return [
+    {
+      id: "android-happ",
+      title: "Android",
+      client: "Happ",
+      path: `/sub/${token}?platform=android&client=happ&format=raw`,
+      steps: ["Установите Happ.", "Добавьте подписку по ссылке или QR-коду.", "Обновите профиль и подключитесь."]
+    },
+    {
+      id: "iphone-happ",
+      title: "iPhone / iPad",
+      client: "Happ",
+      path: `/sub/${token}?platform=iphone&client=happ&format=raw`,
+      steps: ["Установите Happ или совместимый клиент.", "Добавьте подписку по ссылке или QR-коду.", "Разрешите VPN-профиль в iOS."]
+    },
+    {
+      id: "windows-fclashx",
+      title: "Windows",
+      client: "FClashX / Mihomo",
+      path: `/sub/${token}?platform=windows&client=fclashx&format=clash`,
+      steps: ["Установите FClashX или Mihomo-compatible клиент.", "Импортируйте ссылку подписки.", "Выберите профиль akfa vpn и подключитесь."]
+    },
+    {
+      id: "macos-happ",
+      title: "macOS",
+      client: "Happ",
+      path: `/sub/${token}?platform=macos&client=happ&format=raw`,
+      steps: ["Установите Happ.", "Добавьте подписку по ссылке.", "Обновите список серверов и подключитесь."]
+    },
+    {
+      id: "macos-fclashx",
+      title: "macOS",
+      client: "FClashX / Clash",
+      path: `/sub/${token}?platform=macos&client=fclashx&format=clash`,
+      steps: ["Установите FClashX или Clash-compatible клиент.", "Импортируйте ссылку YAML-подписки.", "Выберите профиль akfa vpn."]
+    }
+  ];
 }
 
 function maskToken(value: string) {

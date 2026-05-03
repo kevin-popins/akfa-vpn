@@ -21,6 +21,8 @@ def seed_admin(email: str, password: str, enable_totp: bool) -> None:
             password_hash=hash_password(password),
             role=AdminRole.super_admin.value,
             totp_secret=new_totp_secret() if enable_totp else None,
+            totp_enabled=enable_totp,
+            totp_required=enable_totp,
         )
         db.add(admin)
         seed_default_access_profiles(db)

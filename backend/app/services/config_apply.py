@@ -50,6 +50,8 @@ class ConfigApplySummary:
 
 
 def node_has_installed_xray(node: VpsNode) -> bool:
+    if getattr(node, "xray_installed", False):
+        return True
     log_text = str(node.install_log or [])
     return (
         "Начата реальная установка Xray" in log_text

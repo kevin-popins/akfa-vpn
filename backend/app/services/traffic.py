@@ -8,9 +8,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.security import decrypt_secret
-from app.models import NodeStatus, TrafficSnapshot, UserNodeTraffic, UserStatus, VpsNode, VpnUser
+from app.models import DeviceStatus, NodeStatus, TrafficSnapshot, UserNodeTraffic, UserStatus, VpsNode, VpnUser, VpnUserDevice
 
 USER_TRAFFIC_RE = re.compile(r"user>>>([^>]+)>>>traffic>>>(uplink|downlink)")
+DEVICE_EMAIL_RE = re.compile(r"^akfa_user_(\d+)_device_(\d+)$")
 XRAY_STATS_COMMAND = "/usr/local/bin/xray api statsquery --server=127.0.0.1:10085"
 ONLINE_WINDOW_SECONDS = 180
 
@@ -249,12 +250,56 @@ def apply_xray_stats(
             select(VpnUser).where(VpnUser.status.in_([UserStatus.active.value, UserStatus.traffic_limited.value]))
         ).all()
     }
+    devices = {
+        f"akfa_user_{device.vpn_user_id}_device_{device.id}": device
+        for device in db.scalars(
+            select(VpnUserDevice).where(VpnUserDevice.status.in_([DeviceStatus.active.value, DeviceStatus.revoked.value]))
+        ).all()
+    }
     collected_at = collected_at or datetime.now(timezone.utc)
     akfa_users: list[dict[str, Any]] = []
     matched_users: list[str] = []
     updated_users = 0
 
+    handled_device_users: set[int] = set()
+    for email, device in devices.items():
+        values = stats.get(email)
+        if not values:
+            continue
+        user = device.vpn_user
+        before = traffic_user_state(user)
+        raw_upload = values.get("upload", 0)
+        raw_download = values.get("download", 0)
+        update = apply_device_raw_counters(user, device, raw_upload, raw_download, collected_at)
+        if update["updated"]:
+            updated_users += 1
+        matched_users.append(email)
+        handled_device_users.add(user.id)
+        db.add(
+            TrafficSnapshot(
+                vpn_user_id=user.id,
+                node_id=node.id,
+                upload_bytes=update["upload_delta"],
+                download_bytes=update["download_delta"],
+                total_bytes=update["delta_total"],
+            )
+        )
+        if include_debug:
+            akfa_users.append(
+                {
+                    "id": user.id,
+                    "username": user.username,
+                    "device_id": device.id,
+                    "status": user.status,
+                    "matched": True,
+                    "before": before,
+                    "after": traffic_user_state(user),
+                }
+            )
+
     for username, user in users.items():
+        if user.id in handled_device_users:
+            continue
         before = traffic_user_state(user)
         values = stats.get(username)
         matched = values is not None
@@ -289,7 +334,7 @@ def apply_xray_stats(
                 }
             )
 
-    unmatched_xray_emails = sorted(username for username in stats if username not in users)
+    unmatched_xray_emails = sorted(username for username in stats if username not in users and username not in devices)
     users_without_stats = sorted(username for username in users if username not in stats)
     if commit:
         db.commit()
@@ -374,6 +419,48 @@ def apply_user_node_raw_counters(
     }
 
 
+def apply_device_raw_counters(
+    user: VpnUser,
+    device: VpnUserDevice,
+    raw_upload: int,
+    raw_download: int,
+    collected_at: datetime,
+) -> dict[str, int | bool]:
+    previous_upload = device.last_raw_upload_bytes or 0
+    previous_download = device.last_raw_download_bytes or 0
+    first_collection = previous_upload == 0 and previous_download == 0
+    upload_delta = raw_upload if first_collection else max(raw_upload - previous_upload, 0)
+    download_delta = raw_download if first_collection else max(raw_download - previous_download, 0)
+    if (raw_upload < previous_upload or raw_download < previous_download) and not first_collection:
+        upload_delta = 0
+        download_delta = 0
+    delta_total = upload_delta + download_delta
+    device.last_raw_upload_bytes = raw_upload
+    device.last_raw_download_bytes = raw_download
+    device.last_seen_delta_bytes = delta_total
+    device.last_seen_at = collected_at if delta_total > 0 else device.last_seen_at
+    if delta_total > 0:
+        device.upload_bytes = (device.upload_bytes or 0) + upload_delta
+        device.download_bytes = (device.download_bytes or 0) + download_delta
+        device.total_bytes = (device.total_bytes or 0) + delta_total
+        user.used_upload_bytes = (user.used_upload_bytes or 0) + upload_delta
+        user.used_download_bytes = (user.used_download_bytes or 0) + download_delta
+        user.used_total_bytes = (user.used_total_bytes or 0) + delta_total
+        user.last_seen_delta_bytes = delta_total
+        user.last_online_at = collected_at
+        user.last_traffic_collected_at = collected_at
+    user.last_raw_upload_bytes = sum(device.last_raw_upload_bytes or 0 for device in user.devices)
+    user.last_raw_download_bytes = sum(device.last_raw_download_bytes or 0 for device in user.devices)
+    if user.traffic_limit_bytes and user.used_total_bytes >= user.traffic_limit_bytes:
+        user.status = UserStatus.traffic_limited.value
+    return {
+        "upload_delta": upload_delta,
+        "download_delta": download_delta,
+        "delta_total": delta_total,
+        "updated": delta_total > 0,
+    }
+
+
 def traffic_user_state(user: VpnUser) -> dict[str, Any]:
     return {
         "used_upload_bytes": user.used_upload_bytes or 0,
@@ -412,6 +499,9 @@ def traffic_overview(db: Session) -> list[dict]:
                 "last_online_at": user.last_online_at,
                 "last_traffic_collected_at": user.last_traffic_collected_at,
                 "traffic_limit_bytes": user.traffic_limit_bytes,
+                "devices_label": user.devices_label,
+                "active_devices_count": user.active_devices_count,
+                "device_limit": user.device_limit,
                 "collected": snapshot is not None,
             }
         )

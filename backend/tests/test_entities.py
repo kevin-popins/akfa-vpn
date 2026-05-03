@@ -335,11 +335,14 @@ def test_verified_online_node_gets_default_user_binding_and_config_client(client
     assert user["allowed_node_ids"] == [node.id]
     assert user["primary_node_id"] == node.id
     assert calls and "verified-client" in calls[-1]
+    subscription = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "verified-client-phone"})
+    assert subscription.status_code == 200
 
     db_session.expire_all()
     config = json.loads(render_server_config(db_session.get(VpsNode, node.id), db_session.query(VpnUser).all()))
     clients = config["inbounds"][0]["settings"]["clients"]
-    assert {"id": user["uuid"], "email": "verified-client", "flow": "xtls-rprx-vision"} in clients
+    assert clients[0]["email"] == f"akfa_user_{user['id']}_device_1"
+    assert clients[0]["id"] != user["uuid"]
 
 
 def test_user_create_persists_and_reports_apply_failure(client, auth_headers, db_session, monkeypatch):
@@ -411,7 +414,7 @@ def test_node_update_keeps_subscription_token_and_changes_vless_params(client, a
     assert response.status_code == 200
     assert user["subscription_token"] == token
 
-    subscription = client.get(f"/sub/{token}")
+    subscription = client.get(f"/sub/{token}", headers={"x-hwid": "reality-edit-phone"})
     assert subscription.status_code == 200
     parsed = subscription.text
     assert "vpn.example.com:8443" in parsed

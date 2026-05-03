@@ -4,7 +4,7 @@ from typing import Any
 from app.constants import DEFAULT_DIRECT_DOMAINS, RU_DIRECT_DOMAIN_SUFFIXES, RU_DIRECT_ZONE_RULES
 from urllib.parse import quote
 
-from app.models import AccessProfile, NodeStatus, RoutingMode, UserStatus, VpsNode, VpnUser
+from app.models import AccessProfile, DeviceStatus, NodeManagedMode, NodeStatus, RoutingMode, UserStatus, VpsNode, VpnUser, VpnUserDevice
 from app.services.domain_lists import blocked_domain_matchers, normalize_blocked_domains
 
 
@@ -12,12 +12,28 @@ def active_users(users: list[VpnUser]) -> list[VpnUser]:
     return [user for user in users if user.status == UserStatus.active.value]
 
 
+def active_hwid_devices_for_node(users: list[VpnUser], node: VpsNode) -> list[tuple[VpnUser, VpnUserDevice]]:
+    pairs: list[tuple[VpnUser, VpnUserDevice]] = []
+    for user in active_users(users):
+        if not user_allowed_on_node(user, node):
+            continue
+        for device in user.devices:
+            if device.status == DeviceStatus.active.value and device.hwid_hash:
+                pairs.append((user, device))
+    return pairs
+
+
+def device_email(user: VpnUser, device: VpnUserDevice) -> str:
+    return f"akfa_user_{user.id}_device_{device.id}"
+
+
 def render_server_config(node: VpsNode, users: list[VpnUser]) -> str:
-    clients = [
-        {"id": user.uuid, "email": user.username, "flow": "xtls-rprx-vision"}
-        for user in active_users(users)
-        if user_allowed_on_node(user, node)
+    akfa_clients = [
+        {"id": device.uuid, "email": device_email(user, device), "flow": "xtls-rprx-vision"}
+        for user, device in active_hwid_devices_for_node(users, node)
     ]
+    clients = merge_imported_safe_clients(node, akfa_clients)
+    inbound_tag = node.inbound_tag or "vless-reality"
     config: dict[str, Any] = {
         "log": {"loglevel": "warning"},
         "api": {"services": ["StatsService"], "tag": "api"},
@@ -28,7 +44,7 @@ def render_server_config(node: VpsNode, users: list[VpnUser]) -> str:
         },
         "inbounds": [
             {
-                "tag": "vless-reality",
+                "tag": inbound_tag,
                 "listen": "0.0.0.0",
                 "port": node.vless_port,
                 "protocol": "vless",
@@ -76,6 +92,21 @@ def render_server_config(node: VpsNode, users: list[VpnUser]) -> str:
     return validate_json(config)
 
 
+def merge_imported_safe_clients(node: VpsNode, akfa_clients: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if node.managed_mode != NodeManagedMode.imported_safe.value or not node.imported_inbound:
+        return akfa_clients
+    imported_clients = ((node.imported_inbound.get("settings") or {}).get("clients") or [])
+    akfa_emails = {client.get("email") for client in akfa_clients}
+    unknown_clients = [
+        client
+        for client in imported_clients
+        if isinstance(client, dict)
+        and not str(client.get("email") or "").startswith("akfa_user_")
+        and client.get("email") not in akfa_emails
+    ]
+    return unknown_clients + akfa_clients
+
+
 def validate_server_config(config: dict[str, Any], node: VpsNode) -> None:
     if not config or config == {}:
         raise ValueError("Нельзя применить конфиг: JSON пустой")
@@ -103,7 +134,7 @@ def validate_server_config(config: dict[str, Any], node: VpsNode) -> None:
     if not isinstance(clients, list):
         raise ValueError("Нельзя применить конфиг: clients должен быть списком")
     for client in clients:
-        if client.get("flow") != "xtls-rprx-vision":
+        if str(client.get("email") or "").startswith("akfa_user_") and client.get("flow") != "xtls-rprx-vision":
             raise ValueError("Нельзя применить конфиг: flow клиента должен быть xtls-rprx-vision")
     if "stats" not in config or "policy" not in config:
         raise ValueError("Нельзя применить конфиг: stats и policy обязательны")
@@ -131,11 +162,16 @@ def server_blocked_domain_rules(users: list[VpnUser], node: VpsNode) -> list[dic
         if not user_allowed_on_node(user, node):
             continue
         matchers = blocked_domain_matchers(user.access_profile.blocked_domains if user.access_profile else [])
-        if matchers:
+        emails = [
+            device_email(user, device)
+            for device in user.devices
+            if device.status == DeviceStatus.active.value and device.hwid_hash
+        ]
+        if matchers and emails:
             rules.append(
                 {
                     "type": "field",
-                    "user": [user.username],
+                    "user": emails,
                     "domain": matchers,
                     "outboundTag": "block",
                 }
@@ -173,12 +209,43 @@ def node_label(node: VpsNode) -> str:
     return node.location or node.name
 
 
-def vless_uri(node: VpsNode, user: VpnUser) -> str:
+COUNTRY_NAMES = {
+    "netherlands": ("🇳🇱", "Нидерланды"),
+    "нидерланды": ("🇳🇱", "Нидерланды"),
+    "germany": ("🇩🇪", "Германия"),
+    "германия": ("🇩🇪", "Германия"),
+    "finland": ("🇫🇮", "Финляндия"),
+    "финляндия": ("🇫🇮", "Финляндия"),
+}
+
+
+def clean_server_name(node: VpsNode, suffix: int | None = None) -> str:
+    raw = (node.location or node.name or "").strip()
+    flag, name = COUNTRY_NAMES.get(raw.lower(), ("", raw or "VPN"))
+    base = f"AKFA {flag} {name}".replace("  ", " ").strip()
+    return f"{base} {suffix}" if suffix else base
+
+
+def clean_server_names(nodes: list[VpsNode]) -> dict[int, str]:
+    buckets: dict[str, list[VpsNode]] = {}
+    for node in nodes:
+        buckets.setdefault(clean_server_name(node), []).append(node)
+    result: dict[int, str] = {}
+    for base, items in buckets.items():
+        if len(items) == 1:
+            result[items[0].id] = base
+        else:
+            for index, node in enumerate(sorted(items, key=lambda item: item.id), start=1):
+                result[node.id] = f"{base} {index}"
+    return result
+
+
+def vless_uri(node: VpsNode, device: VpnUserDevice, remark: str | None = None) -> str:
     host = node.public_host or node.ip_address
-    label = quote(f"AKFA - {node_label(node)} - {user.username}")
+    label = quote(remark or clean_server_name(node))
     return (
-        f"vless://{user.uuid}@{host}:{node.vless_port}"
-        f"?type=tcp&security=reality&pbk={node.reality_public_key}&fp={node.fingerprint}"
+        f"vless://{device.uuid}@{host}:{node.vless_port}"
+        f"?encryption=none&type=tcp&security=reality&pbk={node.reality_public_key}&fp={node.fingerprint}"
         f"&sni={node.sni}&sid={node.short_id}&flow=xtls-rprx-vision"
         f"#{label}"
     )
@@ -195,8 +262,9 @@ def ordered_available_nodes(user: VpnUser, nodes: list[VpsNode]) -> list[VpsNode
     return available
 
 
-def render_xray_client_config_for_nodes(nodes: list[VpsNode], user: VpnUser, profile: AccessProfile | None) -> str:
-    proxy_outbounds = [xray_proxy_outbound(node, user, f"proxy-{node.id}" if index else "proxy") for index, node in enumerate(nodes)]
+def render_xray_client_config_for_nodes(nodes: list[VpsNode], user: VpnUser, profile: AccessProfile | None, device: VpnUserDevice | None = None) -> str:
+    device = device or first_active_device(user)
+    proxy_outbounds = [xray_proxy_outbound(node, device, f"proxy-{node.id}" if index else "proxy") for index, node in enumerate(nodes) if device]
     final_proxy_tag = proxy_outbounds[0]["tag"] if proxy_outbounds else "proxy"
     config = {
         "log": {"loglevel": "warning"},
@@ -224,7 +292,11 @@ def render_xray_client_config_for_nodes(nodes: list[VpsNode], user: VpnUser, pro
     return validate_json(config)
 
 
-def xray_proxy_outbound(node: VpsNode, user: VpnUser, tag: str) -> dict[str, Any]:
+def first_active_device(user: VpnUser) -> VpnUserDevice | None:
+    return next((device for device in user.devices if device.status == DeviceStatus.active.value and device.hwid_hash), None)
+
+
+def xray_proxy_outbound(node: VpsNode, device: VpnUserDevice, tag: str) -> dict[str, Any]:
     return {
         "tag": tag,
         "protocol": "vless",
@@ -235,7 +307,7 @@ def xray_proxy_outbound(node: VpsNode, user: VpnUser, tag: str) -> dict[str, Any
                     "port": node.vless_port,
                     "users": [
                         {
-                            "id": user.uuid,
+                            "id": device.uuid,
                             "encryption": "none",
                             "flow": "xtls-rprx-vision",
                         }
@@ -256,14 +328,16 @@ def xray_proxy_outbound(node: VpsNode, user: VpnUser, tag: str) -> dict[str, Any
     }
 
 
-def render_xray_client_config(node: VpsNode, user: VpnUser, profile: AccessProfile | None) -> str:
-    return render_xray_client_config_for_nodes([node], user, profile)
+def render_xray_client_config(node: VpsNode, user: VpnUser, profile: AccessProfile | None, device: VpnUserDevice | None = None) -> str:
+    return render_xray_client_config_for_nodes([node], user, profile, device)
 
 
-def render_sing_box_config_for_nodes(nodes: list[VpsNode], user: VpnUser, profile: AccessProfile | None) -> str:
+def render_sing_box_config_for_nodes(nodes: list[VpsNode], user: VpnUser, profile: AccessProfile | None, device: VpnUserDevice | None = None) -> str:
+    device = device or first_active_device(user)
     proxy_outbounds = [
-        sing_box_proxy_outbound(node, user, f"proxy-{node.id}" if index else "proxy")
+        sing_box_proxy_outbound(node, device, f"proxy-{node.id}" if index else "proxy")
         for index, node in enumerate(nodes)
+        if device
     ]
     final_proxy_tag = proxy_outbounds[0]["tag"] if proxy_outbounds else "proxy"
     config = {
@@ -288,13 +362,13 @@ def render_sing_box_config_for_nodes(nodes: list[VpsNode], user: VpnUser, profil
     return validate_json(config)
 
 
-def sing_box_proxy_outbound(node: VpsNode, user: VpnUser, tag: str) -> dict[str, Any]:
+def sing_box_proxy_outbound(node: VpsNode, device: VpnUserDevice, tag: str) -> dict[str, Any]:
     return {
         "type": "vless",
         "tag": tag,
         "server": node.public_host or node.ip_address,
         "server_port": node.vless_port,
-        "uuid": user.uuid,
+        "uuid": device.uuid,
         "flow": "xtls-rprx-vision",
         "tls": {
             "enabled": True,
@@ -305,8 +379,8 @@ def sing_box_proxy_outbound(node: VpsNode, user: VpnUser, tag: str) -> dict[str,
     }
 
 
-def render_sing_box_config(node: VpsNode, user: VpnUser, profile: AccessProfile | None) -> str:
-    return render_sing_box_config_for_nodes([node], user, profile)
+def render_sing_box_config(node: VpsNode, user: VpnUser, profile: AccessProfile | None, device: VpnUserDevice | None = None) -> str:
+    return render_sing_box_config_for_nodes([node], user, profile, device)
 
 
 def validate_json(config: dict[str, Any]) -> str:

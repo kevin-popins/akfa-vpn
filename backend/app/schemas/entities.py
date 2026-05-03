@@ -120,6 +120,10 @@ class NodeUpdate(BaseModel):
 class NodeRead(NodeBase, OrmModel):
     id: int
     reality_public_key: str | None = None
+    xray_installed: bool = False
+    managed_mode: str = "akfa_owned"
+    inbound_tag: str | None = None
+    import_status: str | None = None
     short_id: str | None = None
     status: str
     last_check_at: datetime | None = None
@@ -160,6 +164,7 @@ class VpnUserBase(BaseModel):
     access_profile_id: int | None = None
     allowed_node_ids: list[int] = Field(default_factory=list)
     primary_node_id: int | None = None
+    device_limit: int = Field(default=5, ge=1, le=100)
     traffic_limit_bytes: int | None = None
     expires_at: datetime | None = None
     status: str = "active"
@@ -173,6 +178,9 @@ class VpnUserRead(VpnUserBase, OrmModel):
     id: int
     uuid: str
     subscription_token: str
+    connect_url: str | None = None
+    devices_label: str = "0/5"
+    active_devices_count: int = 0
     access_status: str
     online_status: str
     used_upload_bytes: int
@@ -184,6 +192,53 @@ class VpnUserRead(VpnUserBase, OrmModel):
     created_at: datetime
     updated_at: datetime
     apply_status: ConfigApplySummaryRead | None = None
+
+
+class VpnUserDeviceRead(OrmModel):
+    id: int
+    vpn_user_id: int
+    name: str | None = None
+    display_name: str | None = None
+    uuid: str
+    status: str
+    hwid_masked: str | None = None
+    platform: str | None = None
+    client_name: str | None = None
+    device_model: str | None = None
+    os_version: str | None = None
+    app_version: str | None = None
+    user_agent: str | None = None
+    created_ip: str | None = None
+    ip_address: str | None = None
+    last_ip_address: str | None = None
+    upload_bytes: int = 0
+    download_bytes: int = 0
+    total_bytes: int = 0
+    last_seen_delta_bytes: int = 0
+    online_status: str = "offline"
+    activated_at: datetime | None = None
+    last_seen_at: datetime | None = None
+    last_subscribed_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class VpnUserDeviceUpdate(BaseModel):
+    name: str | None = None
+    display_name: str | None = None
+    status: str | None = None
+
+
+class PublicConnectRead(BaseModel):
+    display_name: str
+    status: str
+    expires_at: datetime | None = None
+    traffic_limit: int | None = None
+    used_traffic: int = 0
+    device_limit: int
+    active_devices_count: int
+    devices_label: str
+    devices: list[VpnUserDeviceRead] = Field(default_factory=list)
 
 
 class BulkImportResult(BaseModel):
@@ -225,6 +280,9 @@ class TrafficUserRead(BaseModel):
     last_online_at: datetime | None = None
     last_traffic_collected_at: datetime | None = None
     traffic_limit_bytes: int | None = None
+    devices_label: str = "0/5"
+    active_devices_count: int = 0
+    device_limit: int = 5
     collected: bool = False
 
 
@@ -250,3 +308,41 @@ class SniCheckResponse(BaseModel):
 class SshCheckResponse(BaseModel):
     ok: bool
     logs: list[dict] = Field(default_factory=list)
+
+
+class XrayProbeRequest(NodeCreate):
+    pass
+
+
+class XrayProbeResponse(BaseModel):
+    ssh_ok: bool = False
+    xray_installed: bool = False
+    xray_version: str | None = None
+    service_active: bool | None = None
+    service_enabled: bool | None = None
+    config_found: bool = False
+    config_valid: bool = False
+    reality_inbound_found: bool = False
+    partial_import_required: bool = False
+    manual_public_key_required: bool = False
+    public_key_missing: bool = False
+    error: str | None = None
+    inbound_tag: str | None = None
+    listen: str | None = None
+    port: int | None = None
+    clients_count: int = 0
+    server_names: list[str] = Field(default_factory=list)
+    dest: str | None = None
+    private_key: str | None = None
+    public_key: str | None = None
+    short_ids: list[str] = Field(default_factory=list)
+    network: str | None = None
+    security: str | None = None
+    logs: list[dict] = Field(default_factory=list)
+    raw_config: dict | None = None
+    inbound: dict | None = None
+
+
+class XrayImportRequest(BaseModel):
+    probe: XrayProbeResponse | None = None
+    public_key: str | None = None

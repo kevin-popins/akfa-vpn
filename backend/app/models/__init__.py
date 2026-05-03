@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
@@ -28,6 +28,16 @@ class NodeStatus(StrEnum):
     offline = "offline"
     installing = "installing"
     failed = "failed"
+
+
+class NodeManagedMode(StrEnum):
+    akfa_owned = "akfa_owned"
+    imported_safe = "imported_safe"
+
+
+class DeviceStatus(StrEnum):
+    active = "active"
+    revoked = "revoked"
 
 
 class AuthType(StrEnum):
@@ -62,6 +72,11 @@ class Admin(Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255))
     totp_secret: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    totp_secret_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    totp_required: Mapped[bool] = mapped_column(Boolean, default=False)
+    totp_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    recovery_codes_hash: Mapped[list[str] | None] = mapped_column(JsonColumn, nullable=True)
     role: Mapped[str] = mapped_column(String(32), default=AdminRole.admin.value)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -120,6 +135,12 @@ class VpsNode(Base):
     fingerprint: Mapped[str] = mapped_column(String(32), default="chrome")
     xray_config_path: Mapped[str] = mapped_column(String(255), default="/usr/local/etc/xray/config.json")
     xray_service_name: Mapped[str] = mapped_column(String(80), default="xray")
+    xray_installed: Mapped[bool] = mapped_column(Boolean, default=False)
+    managed_mode: Mapped[str] = mapped_column(String(32), default=NodeManagedMode.akfa_owned.value)
+    inbound_tag: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    import_status: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    imported_config: Mapped[dict[str, Any] | None] = mapped_column(JsonColumn, nullable=True)
+    imported_inbound: Mapped[dict[str, Any] | None] = mapped_column(JsonColumn, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default=NodeStatus.draft.value)
     last_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     install_log: Mapped[list[dict[str, Any]]] = mapped_column(JsonColumn, default=list)
@@ -151,6 +172,7 @@ class VpnUser(Base):
     primary_node_id: Mapped[int | None] = mapped_column(ForeignKey("vps_nodes.id"), nullable=True)
     uuid: Mapped[str] = mapped_column(String(36), unique=True)
     subscription_token: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    device_limit: Mapped[int] = mapped_column(Integer, default=5)
     traffic_limit_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     used_upload_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     used_download_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
@@ -172,6 +194,7 @@ class VpnUser(Base):
     primary_node: Mapped[VpsNode | None] = relationship(foreign_keys=[primary_node_id])
     node_traffic: Mapped[list["UserNodeTraffic"]] = relationship(back_populates="vpn_user", cascade="all, delete-orphan")
     snapshots: Mapped[list["TrafficSnapshot"]] = relationship(back_populates="vpn_user")
+    devices: Mapped[list["VpnUserDevice"]] = relationship(back_populates="vpn_user", cascade="all, delete-orphan")
 
     @property
     def allowed_node_ids(self) -> list[int]:
@@ -182,12 +205,79 @@ class VpnUser(Base):
         return self.status
 
     @property
+    def active_devices_count(self) -> int:
+        return len([device for device in self.devices if device.status == DeviceStatus.active.value and device.hwid_hash])
+
+    @property
+    def devices_label(self) -> str:
+        return f"{self.active_devices_count}/{self.device_limit or 0}"
+
+    @property
+    def connect_url(self) -> str:
+        return f"/connect/{self.subscription_token}"
+
+    @property
     def online_status(self) -> str:
+        device_online = any(device.online_status == "online" for device in self.devices)
+        if device_online:
+            return "online"
         if not self.last_online_at:
             return "offline"
         now = datetime.now(self.last_online_at.tzinfo)
         seconds_since_online = (now - self.last_online_at).total_seconds()
         return "online" if seconds_since_online <= 180 else "offline"
+
+
+class VpnUserDevice(Base):
+    __tablename__ = "vpn_user_devices"
+    __table_args__ = (
+        UniqueConstraint("vpn_user_id", "hwid_hash", name="uq_vpn_user_device_hwid"),
+        Index("ix_vpn_user_devices_vpn_user_id", "vpn_user_id"),
+        Index("ix_vpn_user_devices_uuid", "uuid"),
+        Index("ix_vpn_user_devices_subscription_token", "subscription_token"),
+        Index("ix_vpn_user_devices_status", "status"),
+        Index("ix_vpn_user_devices_hwid_hash", "hwid_hash"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    vpn_user_id: Mapped[int] = mapped_column(ForeignKey("vpn_users.id", ondelete="CASCADE"))
+    name: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    uuid: Mapped[str] = mapped_column(String(36), unique=True)
+    subscription_token: Mapped[str] = mapped_column(String(80), unique=True)
+    status: Mapped[str] = mapped_column(String(32), default=DeviceStatus.active.value)
+    hwid_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    hwid_masked: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    hwid_bound_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    platform: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    client_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    device_model: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    os_version: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    app_version: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    upload_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    download_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    total_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    last_raw_upload_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    last_raw_download_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    last_seen_delta_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_subscribed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    vpn_user: Mapped[VpnUser] = relationship(back_populates="devices")
+
+    @property
+    def online_status(self) -> str:
+        if not self.last_seen_at:
+            return "offline"
+        now = datetime.now(self.last_seen_at.tzinfo)
+        return "online" if (now - self.last_seen_at).total_seconds() <= 180 else "offline"
 
 
 class VpnUserNode(Base):

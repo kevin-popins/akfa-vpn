@@ -1,7 +1,8 @@
 import json
+import base64
 from urllib.parse import parse_qs, urlparse
 
-from app.models import VpsNode
+from app.models import VpnUserDevice, VpsNode
 
 
 def test_config_preview_contains_required_reality_fields(client, auth_headers):
@@ -52,6 +53,88 @@ def test_subscription_fails_safely_for_disabled_user(client, auth_headers):
     assert response.status_code == 404
 
 
+def test_hwid_hard_mode_requires_hwid_and_enforces_device_limit(client, auth_headers, db_session):
+    node_payload = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "HWID", "location": "Netherlands", "ip_address": "203.0.113.90", "ssh_username": "root", "ssh_password": "secret"},
+    ).json()
+    node = db_session.get(VpsNode, node_payload["id"])
+    node.status = "online"
+    node.reality_public_key = "public"
+    node.reality_private_key = "private"
+    node.short_id = "abcdef1234567890"
+    db_session.commit()
+    user = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={"first_name": "Hard", "last_name": "Mode", "username": "hard-mode", "device_limit": 2},
+    ).json()
+
+    missing = client.get(f"/sub/{user['subscription_token']}")
+    assert missing.status_code == 403
+    assert missing.text == "Ваш клиент не поддерживает ограничение устройств"
+    assert missing.headers["x-hwid-not-supported"] == "true"
+    assert db_session.query(VpnUserDevice).count() == 0
+
+    first = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "phone-1", "x-device-model": "Pixel 8", "x-device-os": "Android"})
+    assert first.status_code == 200
+    second = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "phone-2"})
+    assert second.status_code == 200
+    repeat = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "phone-1", "x-real-ip": "198.51.100.10"})
+    assert repeat.status_code == 200
+    assert db_session.query(VpnUserDevice).filter_by(vpn_user_id=user["id"], status="active").count() == 2
+
+    third = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "phone-3"})
+    assert third.status_code == 403
+    assert third.text == "Превышен лимит устройств"
+    assert third.headers["x-hwid-max-devices-reached"] == "true"
+    assert db_session.query(VpnUserDevice).filter_by(vpn_user_id=user["id"], status="active").count() == 2
+
+
+def test_device_subscription_requires_matching_hwid_and_clash_is_yaml(client, auth_headers, db_session):
+    node_payload = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "Amsterdam", "location": "Netherlands", "ip_address": "203.0.113.91", "ssh_username": "root", "ssh_password": "secret"},
+    ).json()
+    node = db_session.get(VpsNode, node_payload["id"])
+    node.status = "online"
+    node.reality_public_key = "public"
+    node.reality_private_key = "private"
+    node.short_id = "abcdef1234567890"
+    db_session.commit()
+    user = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={"first_name": "Device", "last_name": "Sub", "username": "device-sub"},
+    ).json()
+    raw = client.get(f"/sub/{user['subscription_token']}?format=raw", headers={"x-hwid": "device-hwid"})
+    assert raw.status_code == 200
+    assert "encryption=none" in raw.text
+    device = db_session.query(VpnUserDevice).filter_by(vpn_user_id=user["id"]).one()
+
+    assert client.get(f"/sub/device/{device.subscription_token}").status_code == 403
+    wrong = client.get(f"/sub/device/{device.subscription_token}", headers={"x-hwid": "other-device"})
+    assert wrong.status_code == 403
+    assert wrong.text == "Ссылка подписки привязана к другому устройству"
+
+    clash = client.get(f"/sub/{user['subscription_token']}?format=clash", headers={"x-hwid": "device-hwid"})
+    assert clash.status_code == 200
+    assert clash.headers["profile-title"] == "akfa vpn"
+    assert 'filename="akfa-vpn.yaml"' in clash.headers["content-disposition"]
+    assert "proxies:" in clash.text
+    assert "proxy-groups:" in clash.text
+    assert "rules:" in clash.text
+    assert "AKFA 🇳🇱 Нидерланды" in clash.text
+    assert "device-sub" not in clash.text
+    assert user["subscription_token"] not in clash.text
+
+    encoded = client.get(f"/sub/{user['subscription_token']}?format=base64", headers={"x-hwid": "device-hwid"})
+    assert encoded.status_code == 200
+    assert base64.b64decode(encoded.text).decode("utf-8").startswith("vless://")
+
+
 def test_subscription_returns_all_client_formats(client, auth_headers, db_session):
     node_payload = client.post(
         "/admin/nodes",
@@ -69,12 +152,17 @@ def test_subscription_returns_all_client_formats(client, auth_headers, db_sessio
         headers=auth_headers,
         json={"first_name": "Мария", "last_name": "Орлова", "username": "maria"},
     ).json()
+    created = client.get(
+        f"/sub/{user['subscription_token']}?platform=android&client=happ&format=raw",
+        headers={"x-hwid": "phone-1", "x-device-os": "Android", "x-device-model": "Samsung S23"},
+    )
+    assert created.status_code == 200
     response = client.get(f"/admin/users/{user['id']}/subscription-preview")
     assert response.status_code == 200
     assert response.json()["vless_uri"].startswith("vless://")
     assert "xray_json" in response.json()
     assert "sing_box" in response.json()
-    plain = client.get(f"/sub/{user['subscription_token']}")
+    plain = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "phone-1"})
     assert plain.status_code == 200
     assert plain.headers["content-type"].startswith("text/plain")
     assert plain.text.startswith("vless://")
@@ -112,7 +200,7 @@ def test_subscription_for_user_with_two_nodes_returns_two_vless_uris_primary_fir
         },
     ).json()
 
-    response = client.get(f"/sub/{user['subscription_token']}")
+    response = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "multi-phone"})
     assert response.status_code == 200
     uri_lines = response.text.splitlines()
     assert len(uri_lines) == 2
@@ -141,23 +229,25 @@ def test_node_config_includes_only_users_allowed_on_that_node(client, auth_heade
     second.status = "online"
     db_session.commit()
 
-    client.post(
+    both = client.post(
         "/admin/users",
         headers=auth_headers,
         json={"first_name": "Both", "last_name": "Nodes", "username": "both-nodes", "allowed_node_ids": [first.id, second.id]},
-    )
-    client.post(
+    ).json()
+    only = client.post(
         "/admin/users",
         headers=auth_headers,
         json={"first_name": "Only", "last_name": "A", "username": "only-a", "allowed_node_ids": [first.id]},
-    )
+    ).json()
+    client.get(f"/sub/{both['subscription_token']}", headers={"x-hwid": "both-phone"})
+    client.get(f"/sub/{only['subscription_token']}", headers={"x-hwid": "only-phone"})
 
     first_config = client.get(f"/admin/nodes/{first.id}/config-preview", headers=auth_headers).json()
     second_config = client.get(f"/admin/nodes/{second.id}/config-preview", headers=auth_headers).json()
     first_clients = {client_item["email"] for client_item in first_config["inbounds"][0]["settings"]["clients"]}
     second_clients = {client_item["email"] for client_item in second_config["inbounds"][0]["settings"]["clients"]}
-    assert first_clients == {"both-nodes", "only-a"}
-    assert second_clients == {"both-nodes"}
+    assert first_clients == {f"akfa_user_{both['id']}_device_1", f"akfa_user_{only['id']}_device_2"}
+    assert second_clients == {f"akfa_user_{both['id']}_device_1"}
 
 
 def test_client_config_uses_node_sni_and_reality_parameters(client, auth_headers, db_session):
@@ -181,6 +271,8 @@ def test_client_config_uses_node_sni_and_reality_parameters(client, auth_headers
         headers=auth_headers,
         json={"first_name": "Илья", "last_name": "Клиент", "username": "ilya"},
     ).json()
+    created = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "ilya-phone"})
+    assert created.status_code == 200
 
     response = client.get(f"/admin/users/{user['id']}/subscription-preview")
     assert response.status_code == 200
@@ -226,6 +318,7 @@ def test_ru_direct_client_config_blocks_torrent_and_routes_ru_zones_direct(clien
         headers=auth_headers,
         json={"first_name": "Ру", "last_name": "Директ", "username": "ru-direct", "access_profile_id": profile["id"]},
     ).json()
+    client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "ru-direct-phone"})
 
     response = client.get(f"/admin/users/{user['id']}/subscription-preview")
     assert response.status_code == 200
@@ -261,6 +354,7 @@ def test_full_vpn_client_config_blocks_torrent_without_ru_direct_rules(client, a
         headers=auth_headers,
         json={"first_name": "Фулл", "last_name": "ВПН", "username": "full-vpn", "access_profile_id": profile["id"]},
     ).json()
+    client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "full-phone"})
 
     response = client.get(f"/admin/users/{user['id']}/subscription-preview")
     assert response.status_code == 200
@@ -295,6 +389,7 @@ def test_blocked_domains_are_before_ru_direct_and_proxy_in_client_config(client,
         headers=auth_headers,
         json={"first_name": "Блок", "last_name": "Ютуб", "username": "block-youtube", "access_profile_id": profile["id"]},
     ).json()
+    client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "block-phone"})
 
     response = client.get(f"/admin/users/{user['id']}/subscription-preview")
     assert response.status_code == 200
@@ -329,6 +424,7 @@ def test_full_vpn_with_blocked_domain_blocks_domain(client, auth_headers, db_ses
         headers=auth_headers,
         json={"first_name": "Фулл", "last_name": "Блок", "username": "full-block", "access_profile_id": profile["id"]},
     ).json()
+    client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "full-block-phone"})
 
     response = client.get(f"/admin/users/{user['id']}/subscription-preview")
     assert response.status_code == 200
@@ -359,6 +455,7 @@ def test_sing_box_config_includes_blocked_domains(client, auth_headers, db_sessi
         headers=auth_headers,
         json={"first_name": "Sing", "last_name": "Box", "username": "sing-block", "access_profile_id": profile["id"]},
     ).json()
+    client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "sing-phone"})
 
     response = client.get(f"/admin/users/{user['id']}/subscription-preview")
     assert response.status_code == 200
@@ -388,6 +485,7 @@ def test_subscription_reflects_blocked_domain_changes_without_token_change(clien
         headers=auth_headers,
         json={"first_name": "Sub", "last_name": "Block", "username": "sub-block", "access_profile_id": profile["id"]},
     ).json()
+    client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "sub-block-phone"})
 
     first = client.get(f"/admin/users/{user['id']}/subscription-preview", headers=auth_headers).json()
     profile_payload = {
@@ -420,6 +518,7 @@ def test_server_config_contains_per_user_blocked_domains(client, auth_headers, d
         headers=auth_headers,
         json={"name": "Server Block", "ip_address": "203.0.113.32", "ssh_username": "root", "ssh_password": "secret"},
     ).json()
+    client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "server-block-phone"})
     db_session.expire_all()
 
     response = client.get(f"/admin/nodes/{node['id']}/config-preview", headers=auth_headers)
@@ -430,7 +529,7 @@ def test_server_config_contains_per_user_blocked_domains(client, auth_headers, d
     assert rules[1] == {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"}
     assert rules[2] == {
         "type": "field",
-        "user": [user["username"]],
+            "user": [f"akfa_user_{user['id']}_device_1"],
         "domain": ["regexp:^(.+\\.)?youtube\\.com$"],
         "outboundTag": "block",
     }

@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, TypeVar
 
-from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, UploadFile, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -22,6 +22,9 @@ from app.models import (
     TrafficSnapshot,
     UserNodeTraffic,
     UserStatus,
+    DeviceStatus,
+    NodeManagedMode,
+    VpnUserDevice,
     VpnUserNode,
     VpnUser,
     VpsNode,
@@ -43,6 +46,12 @@ from app.schemas.entities import (
     SshCheckResponse,
     TrafficSnapshotRead,
     TrafficUserRead,
+    PublicConnectRead,
+    VpnUserDeviceRead,
+    VpnUserDeviceUpdate,
+    XrayImportRequest,
+    XrayProbeRequest,
+    XrayProbeResponse,
     VpnUserCreate,
     VpnUserRead,
 )
@@ -53,13 +62,15 @@ from app.services.backup import build_backup_archive, restore_backup_archive
 from app.services.config_apply import ConfigApplyService, ConfigApplySummary
 from app.services.server_metrics import collect_nodes_metrics
 from app.services.ssh_installer import XrayInstaller
-from app.services.subscriptions import get_subscription, subscription_payload
+from app.services.hwid import apply_device_metadata, build_display_name, compute_hwid_context
+from app.services.subscriptions import subscription_payload, subscription_response, validate_subscription_user
 from app.services.traffic import (
     collect_traffic as collect_traffic_stats,
     enforce_expiration_and_limits,
     traffic_overview,
 )
 from app.services.xray_config import render_server_config
+from app.services.xray_probe import import_probe_to_node, probe_xray
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 public_router = APIRouter(tags=["subscriptions"])
@@ -298,6 +309,7 @@ async def verify_node(node_id: int, admin: Admin = Depends(require_write), db: S
     result = await XrayInstaller(node).verify()
     node.install_log = result.logs
     node.status = NodeStatus.online.value if result.ok else NodeStatus.failed.value
+    node.xray_installed = bool(result.ok)
     node.last_check_at = datetime.now(timezone.utc)
     audit(db, "verify_xray", "vps_node", node.id, admin.id)
     db.commit()
@@ -314,11 +326,54 @@ async def install_node(node_id: int, admin: Admin = Depends(require_write), db: 
     result = await XrayInstaller(node, users).install()
     node.install_log = result.logs
     node.status = NodeStatus.online.value if result.ok else NodeStatus.failed.value
+    node.xray_installed = bool(result.ok)
+    node.managed_mode = NodeManagedMode.akfa_owned.value
     node.reality_private_key = result.reality_private_key or node.reality_private_key
     node.reality_public_key = result.reality_public_key or node.reality_public_key
     node.short_id = result.short_id or node.short_id
     node.last_check_at = datetime.now(timezone.utc)
     audit(db, "install_xray", "vps_node", node.id, admin.id)
+    db.commit()
+    return node
+
+
+@router.post("/nodes/probe", response_model=XrayProbeResponse)
+async def probe_new_node(payload: XrayProbeRequest, _: Admin = Depends(require_write)) -> XrayProbeResponse:
+    data = payload.model_dump(exclude={"ssh_password", "private_key"})
+    data["public_host"] = payload.public_host or payload.ip_address
+    node = VpsNode(
+        **data,
+        encrypted_ssh_password=encrypt_secret(payload.ssh_password),
+        encrypted_private_key=encrypt_secret(payload.private_key),
+    )
+    return await probe_xray(node)
+
+
+@router.post("/nodes/{node_id}/probe", response_model=XrayProbeResponse)
+async def probe_existing_node(node_id: int, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> XrayProbeResponse:
+    node = _get_or_404(db, VpsNode, node_id)
+    result = await probe_xray(node)
+    node.install_log = result.logs
+    node.last_check_at = datetime.now(timezone.utc)
+    audit(db, "probe_xray", "vps_node", node.id, admin.id)
+    db.commit()
+    return result
+
+
+@router.post("/nodes/{node_id}/import-xray", response_model=NodeRead)
+async def import_existing_xray(
+    node_id: int,
+    payload: XrayImportRequest,
+    admin: Admin = Depends(require_write),
+    db: Session = Depends(get_db),
+) -> VpsNode:
+    node = _get_or_404(db, VpsNode, node_id)
+    probe = payload.probe or await probe_xray(node)
+    try:
+        import_probe_to_node(node, probe, payload.public_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    audit(db, "import_xray", "vps_node", node.id, admin.id)
     db.commit()
     return node
 
@@ -359,6 +414,8 @@ def node_config_preview(node_id: int, _: Admin = Depends(current_admin), db: Ses
     node = _get_or_404(db, VpsNode, node_id)
     ensure_reality_credentials(node)
     users = list(db.scalars(select(VpnUser)))
+    for user in users:
+        db.expire(user, ["devices", "node_links"])
     return Response(render_server_config(node, users), media_type="application/json")
 
 
@@ -427,6 +484,9 @@ def get_user(user_id: int, _: Admin = Depends(current_admin), db: Session = Depe
 @router.put("/users/{user_id}", response_model=VpnUserRead)
 async def update_user(user_id: int, payload: VpnUserCreate, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> VpnUser:
     user = _get_or_404(db, VpnUser, user_id)
+    active_devices = user.active_devices_count
+    if payload.device_limit < active_devices:
+        raise HTTPException(status_code=400, detail="Нельзя установить лимит меньше текущего количества активных устройств.")
     allowed_node_ids = normalize_allowed_node_ids(db, payload.allowed_node_ids, payload.status)
     if payload.status == UserStatus.active.value and not allowed_node_ids and has_online_nodes(db):
         raise HTTPException(status_code=422, detail="Активному пользователю нужен хотя бы один доступный сервер")
@@ -523,6 +583,57 @@ async def reset_user_traffic(user_id: int, admin: Admin = Depends(require_write)
     summary = await auto_apply_after_change(db, admin, set(user.allowed_node_ids or []), "auto_apply_after_traffic_reset")
     db.commit()
     return attach_apply_status(user, summary)
+
+
+@router.get("/users/{user_id}/devices", response_model=list[VpnUserDeviceRead])
+def list_user_devices(user_id: int, _: Admin = Depends(current_admin), db: Session = Depends(get_db)) -> list[VpnUserDevice]:
+    user = _get_or_404(db, VpnUser, user_id)
+    return list(db.scalars(select(VpnUserDevice).where(VpnUserDevice.vpn_user_id == user.id).order_by(VpnUserDevice.created_at.desc())))
+
+
+@router.patch("/users/{user_id}/devices/{device_id}", response_model=VpnUserDeviceRead)
+async def update_user_device(
+    user_id: int,
+    device_id: int,
+    payload: VpnUserDeviceUpdate,
+    admin: Admin = Depends(require_write),
+    db: Session = Depends(get_db),
+) -> VpnUserDevice:
+    user = _get_or_404(db, VpnUser, user_id)
+    device = _get_or_404(db, VpnUserDevice, device_id)
+    if device.vpn_user_id != user.id:
+        raise HTTPException(status_code=404, detail="Устройство не найдено")
+    for key, value in payload.model_dump(exclude_unset=True).items():
+        setattr(device, key, value)
+    audit(db, "update_device", "vpn_user_device", device.id, admin.id)
+    summary = await auto_apply_after_change(db, admin, set(user.allowed_node_ids or []), "auto_apply_after_device_update")
+    db.commit()
+    setattr(device, "apply_status", summary.as_dict())
+    return device
+
+
+@router.post("/users/{user_id}/devices/{device_id}/revoke", response_model=VpnUserDeviceRead)
+async def revoke_user_device(user_id: int, device_id: int, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> VpnUserDevice:
+    user = _get_or_404(db, VpnUser, user_id)
+    device = _get_or_404(db, VpnUserDevice, device_id)
+    if device.vpn_user_id != user.id:
+        raise HTTPException(status_code=404, detail="Устройство не найдено")
+    device.status = DeviceStatus.revoked.value
+    audit(db, "revoke_device", "vpn_user_device", device.id, admin.id)
+    await auto_apply_after_change(db, admin, set(user.allowed_node_ids or []), "auto_apply_after_device_revoke")
+    db.commit()
+    return device
+
+
+@router.post("/users/{user_id}/devices/reset", response_model=list[VpnUserDeviceRead])
+async def reset_user_devices(user_id: int, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> list[VpnUserDevice]:
+    user = _get_or_404(db, VpnUser, user_id)
+    for device in user.devices:
+        device.status = DeviceStatus.revoked.value
+    audit(db, "reset_devices", "vpn_user", user.id, admin.id)
+    await auto_apply_after_change(db, admin, set(user.allowed_node_ids or []), "auto_apply_after_devices_reset")
+    db.commit()
+    return user.devices
 
 
 @router.post("/users/import", response_model=BulkImportResult)
@@ -685,10 +796,135 @@ async def import_backup(file: UploadFile, admin: Admin = Depends(require_write),
     return RestoreSummary(restored=restored, apply_status=summary.as_dict())
 
 
+def _hwid_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
+    headers = {"x-hwid-limit": "true"}
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def _plain_forbidden(message: str, extra_headers: dict[str, str] | None = None) -> Response:
+    return Response(message, status_code=403, media_type="text/plain; charset=utf-8", headers=_hwid_headers(extra_headers))
+
+
+def _touch_device_from_context(device: VpnUserDevice, context, db: Session) -> None:
+    apply_device_metadata(device, context, created=False)
+    db.flush()
+
+
+async def _apply_for_subscription(db: Session, user: VpnUser) -> None:
+    await ConfigApplyService(db).apply_to_nodes(set(user.allowed_node_ids or []), reason="auto_apply_after_hwid_device_change")
+
+
+@public_router.get("/public/connect/{user_token}", response_model=PublicConnectRead)
+def public_connect(user_token: str, db: Session = Depends(get_db)) -> PublicConnectRead:
+    user = validate_subscription_user(db.scalar(select(VpnUser).where(VpnUser.subscription_token == user_token)))
+    devices = [device for device in user.devices if device.status == DeviceStatus.active.value]
+    return PublicConnectRead(
+        display_name=f"{user.first_name} {user.last_name}".strip() or user.username,
+        status=user.status,
+        expires_at=user.expires_at,
+        traffic_limit=user.traffic_limit_bytes,
+        used_traffic=user.used_total_bytes or 0,
+        device_limit=user.device_limit,
+        active_devices_count=user.active_devices_count,
+        devices_label=user.devices_label,
+        devices=devices,
+    )
+
+
+@public_router.post("/public/connect/{user_token}/install-link")
+def deprecated_install_link(user_token: str) -> Response:
+    return Response(
+        "Install-link flow deprecated. Используйте /sub/{user_token} с x-hwid.",
+        status_code=status.HTTP_410_GONE,
+        media_type="text/plain; charset=utf-8",
+    )
+
+
+@public_router.get("/sub/device/{device_token}")
+def device_subscription(
+    device_token: str,
+    request: Request,
+    format: str | None = None,
+    db: Session = Depends(get_db),
+) -> Response:
+    device = db.scalar(select(VpnUserDevice).where(VpnUserDevice.subscription_token == device_token))
+    if not device:
+        raise HTTPException(status_code=404, detail="Подписка недоступна")
+    user = validate_subscription_user(device.vpn_user)
+    context = compute_hwid_context(request, device.platform, device.client_name)
+    if not context:
+        return _plain_forbidden("Ваш клиент не поддерживает ограничение устройств", {"x-hwid-not-supported": "true"})
+    if device.status != DeviceStatus.active.value:
+        return _plain_forbidden("Устройство отключено")
+    if not device.hwid_hash or context.hwid_hash != device.hwid_hash:
+        return _plain_forbidden("Ссылка подписки привязана к другому устройству")
+    _touch_device_from_context(device, context, db)
+    db.commit()
+    response = subscription_response(db, user, device, format)
+    response.headers["x-hwid-limit"] = "true"
+    response.headers["x-hwid-active"] = "true"
+    return response
+
+
 @public_router.get("/sub/{token}")
-def subscription(token: str, db: Session = Depends(get_db)) -> Response:
-    payload = get_subscription(db, token)
-    return Response(str(payload["vless_uri"]), media_type="text/plain; charset=utf-8")
+async def subscription(
+    token: str,
+    request: Request,
+    platform: str | None = None,
+    client: str | None = None,
+    format: str | None = None,
+    db: Session = Depends(get_db),
+) -> Response:
+    user = validate_subscription_user(db.scalar(select(VpnUser).where(VpnUser.subscription_token == token)))
+    context = compute_hwid_context(request, platform, client)
+    if not context:
+        return _plain_forbidden("Ваш клиент не поддерживает ограничение устройств", {"x-hwid-not-supported": "true"})
+
+    device = db.scalar(
+        select(VpnUserDevice).where(
+            VpnUserDevice.vpn_user_id == user.id,
+            VpnUserDevice.hwid_hash == context.hwid_hash,
+        )
+    )
+    if device:
+        if device.status != DeviceStatus.active.value:
+            return _plain_forbidden("Устройство отключено")
+        _touch_device_from_context(device, context, db)
+        db.commit()
+        response = subscription_response(db, user, device, format)
+        response.headers["x-hwid-limit"] = "true"
+        response.headers["x-hwid-active"] = "true"
+        return response
+
+    db.expire(user, ["devices"])
+    if user.active_devices_count >= user.device_limit:
+        return _plain_forbidden("Превышен лимит устройств", {"x-hwid-max-devices-reached": "true"})
+
+    device = VpnUserDevice(
+        vpn_user_id=user.id,
+        uuid=str(uuid.uuid4()),
+        subscription_token=secrets.token_urlsafe(32),
+        status=DeviceStatus.active.value,
+    )
+    db.add(device)
+    db.flush()
+    apply_device_metadata(device, context, created=True)
+    if not device.display_name or device.display_name == "Новое устройство":
+        device.display_name = build_display_name(
+            device_model=device.device_model,
+            platform=device.platform,
+            os_version=device.os_version,
+            client_name=device.client_name,
+            device_id=device.id,
+        )
+    await _apply_for_subscription(db, user)
+    db.commit()
+    response = subscription_response(db, user, device, format)
+    response.headers["x-hwid-limit"] = "true"
+    response.headers["x-hwid-active"] = "true"
+    return response
 
 
 @router.post("/seed/default-profile", response_model=list[AccessProfileRead])

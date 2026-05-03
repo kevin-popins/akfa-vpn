@@ -10,6 +10,20 @@ class LoginRequest(BaseModel):
 
 class TotpVerifyRequest(BaseModel):
     code: str
+    login_token: str | None = None
+
+
+class TotpSetupStartRequest(BaseModel):
+    login_token: str | None = None
+
+
+class TotpSetupConfirmRequest(BaseModel):
+    code: str
+    login_token: str | None = None
+
+
+class TotpDisableRequest(BaseModel):
+    password: str
 
 
 class AdminRead(OrmModel):
@@ -22,6 +36,12 @@ class AdminRead(OrmModel):
 
 class LoginResponse(BaseModel):
     requires_2fa: bool
+    setup_required: bool = False
+    login_token: str | None = None
     csrf_token: str | None = None
     admin: AdminRead | None = None
 
+
+class TotpSetupStartResponse(BaseModel):
+    secret: str
+    otpauth_url: str

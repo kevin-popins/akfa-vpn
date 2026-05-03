@@ -16,6 +16,7 @@ from app.core.config import settings
 password_hasher = PasswordHasher()
 session_serializer = URLSafeTimedSerializer(settings.session_secret, salt="akfa-session")
 csrf_serializer = URLSafeTimedSerializer(settings.session_secret, salt="akfa-csrf")
+login_token_serializer = URLSafeTimedSerializer(settings.session_secret, salt="akfa-login-token")
 _login_attempts: dict[str, list[float]] = defaultdict(list)
 
 
@@ -40,6 +41,26 @@ def verify_totp(secret: str | None, code: str | None) -> bool:
     if not code:
         return False
     return pyotp.TOTP(secret).verify(code, valid_window=1)
+
+
+def totp_uri(secret: str, email: str) -> str:
+    return pyotp.TOTP(secret).provisioning_uri(name=email, issuer_name="AKFA")
+
+
+def create_login_token(admin_id: int, purpose: str) -> str:
+    return login_token_serializer.dumps({"admin_id": admin_id, "purpose": purpose})
+
+
+def read_login_token(value: str | None, purpose: str, max_age_seconds: int = 300) -> dict[str, Any] | None:
+    if not value:
+        return None
+    try:
+        data = login_token_serializer.loads(value, max_age=max_age_seconds)
+    except BadSignature:
+        return None
+    if data.get("purpose") != purpose:
+        return None
+    return data
 
 
 def create_session(admin_id: int, needs_2fa: bool = False) -> str:
