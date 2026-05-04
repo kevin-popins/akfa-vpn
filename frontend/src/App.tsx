@@ -576,7 +576,12 @@ function AdminPages({
       nodeActionStages(action).forEach(([delay, message]) => {
         timers.push(window.setTimeout(() => setOperation({ title, message, tone: "pending" }), delay));
       });
-      const updated = action === "apply-config" ? await api.applyConfig(node.id) : await api.nodeAction(node.id, action);
+      const updated =
+        action === "install"
+          ? await runInstallJob(node.id, title, setOperation)
+          : action === "apply-config"
+            ? await api.applyConfig(node.id)
+            : await api.nodeAction(node.id, action);
       upsertNode(updated);
       const failedInstall = action === "install" && (!updated.xray_installed || updated.status !== "online");
       if (failedInstall) {
@@ -3536,6 +3541,38 @@ function nodeActionErrorMessage(action: NodeAction, message: string) {
   if (action === "dry-run") return `Сухой запуск не выполнен: ${message}`;
   if (action === "verify") return `Проверка Xray не выполнена: ${message}`;
   return `Проверка SSH не выполнена: ${message}`;
+}
+
+async function runInstallJob(
+  nodeId: number,
+  title: string,
+  setOperation: (state: OperationState) => void
+): Promise<NodeRead> {
+  const accepted = await api.startNodeInstall(nodeId);
+  let lastJob = await api.nodeActionJob(accepted.job_id);
+  const startedAt = Date.now();
+  while (lastJob.status === "pending" || lastJob.status === "running") {
+    setOperation({ title, message: lastJob.current_step || "Установка выполняется...", tone: "pending" });
+    if (Date.now() - startedAt > 20 * 60 * 1000) {
+      throw new Error("Сервер не ответил вовремя. Проверьте статус установки в журнале.");
+    }
+    await sleep(1500);
+    lastJob = await api.nodeActionJob(accepted.job_id);
+  }
+  if (lastJob.status === "success" && lastJob.result) {
+    return lastJob.result;
+  }
+  if (lastJob.status === "success") {
+    const nodes = await api.nodes();
+    const node = nodes.find((item) => item.id === nodeId);
+    if (node) return node;
+    throw new Error("Установка завершена, но нода не найдена в списке.");
+  }
+  throw new Error(lastJob.error || nodeLogFailureReason(lastJob.logs) || "Установка Xray не завершена");
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function nodeLogFailureReason(logs: Array<Record<string, unknown>>) {

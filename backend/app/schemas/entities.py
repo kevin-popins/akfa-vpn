@@ -136,6 +136,25 @@ class NodeRead(NodeBase, OrmModel):
     apply_status: ConfigApplySummaryRead | None = None
 
 
+class NodeActionJobAccepted(BaseModel):
+    job_id: str
+    status: str
+    current_step: str
+
+
+class NodeActionJobRead(BaseModel):
+    job_id: str
+    node_id: int
+    action: str
+    status: str
+    current_step: str
+    logs: list[dict] = Field(default_factory=list)
+    error: str | None = None
+    result: dict | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
 class NodeMetricsRead(BaseModel):
     node_id: int
     name: str

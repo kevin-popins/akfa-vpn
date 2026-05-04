@@ -1,8 +1,33 @@
 import io
 import json
 import tarfile
+import time
+import asyncio
 
+from sqlalchemy.orm import sessionmaker
+
+import app.services.node_action_jobs as node_action_jobs
 from app.services.ssh_installer import InstallResult, READ_ONLY_CHECK_COMMANDS, XrayInstaller
+
+
+def wait_node_job(client, headers, job_id: str, timeout: float = 5.0):
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        response = client.get(f"/admin/node-actions/{job_id}", headers=headers)
+        assert response.status_code == 200
+        last = response.json()
+        if last["status"] not in {"pending", "running"}:
+            return last
+        time.sleep(0.05)
+    raise AssertionError(f"job did not finish: {last}")
+
+
+def patch_node_job_session(monkeypatch, db_session):
+    JobSessionLocal = sessionmaker(bind=db_session.get_bind(), autoflush=False, autocommit=False, expire_on_commit=False)
+    monkeypatch.setattr(node_action_jobs, "SessionLocal", JobSessionLocal)
+    node_action_jobs._jobs.clear()
+    node_action_jobs._running_install_by_node.clear()
 
 
 def test_departments_profiles_users_nodes_flow(client, auth_headers):
@@ -258,6 +283,7 @@ def test_verify_endpoint_handles_failed_status(client, auth_headers, monkeypatch
 
 
 def test_install_failure_returns_error_and_does_not_mark_xray_installed(client, auth_headers, db_session, monkeypatch):
+    patch_node_job_session(monkeypatch, db_session)
     node = client.post(
         "/admin/nodes",
         headers=auth_headers,
@@ -281,17 +307,21 @@ def test_install_failure_returns_error_and_does_not_mark_xray_installed(client, 
 
     monkeypatch.setattr(XrayInstaller, "install", fake_install)
     response = client.post(f"/admin/nodes/{node['id']}/install", headers=auth_headers)
-    assert response.status_code == 502
-    assert "Установка Xray не завершена" in str(response.json()["detail"])
+    assert response.status_code == 202
+    job = wait_node_job(client, auth_headers, response.json()["job_id"])
+    assert job["status"] == "failed"
+    assert "Установка Xray не завершена" in job["error"]
 
     from app.models import VpsNode
 
     saved = db_session.get(VpsNode, node["id"])
+    db_session.refresh(saved)
     assert saved.status == "failed"
     assert saved.xray_installed is False
 
 
 def test_install_success_marks_node_online(client, auth_headers, db_session, monkeypatch):
+    patch_node_job_session(monkeypatch, db_session)
     node = client.post(
         "/admin/nodes",
         headers=auth_headers,
@@ -303,13 +333,16 @@ def test_install_success_marks_node_online(client, auth_headers, db_session, mon
 
     monkeypatch.setattr(XrayInstaller, "install", fake_install)
     response = client.post(f"/admin/nodes/{node['id']}/install", headers=auth_headers)
-    assert response.status_code == 200
-    assert response.json()["status"] == "online"
-    assert response.json()["xray_installed"] is True
+    assert response.status_code == 202
+    job = wait_node_job(client, auth_headers, response.json()["job_id"])
+    assert job["status"] == "success"
+    assert job["result"]["status"] == "online"
+    assert job["result"]["xray_installed"] is True
 
     from app.models import VpsNode
 
     saved = db_session.get(VpsNode, node["id"])
+    db_session.refresh(saved)
     assert saved.status == "online"
     assert saved.xray_installed is True
 
@@ -326,6 +359,27 @@ def test_install_commands_have_longer_timeouts(client, auth_headers):
     assert installer._timeout_for_command("DEBIAN_FRONTEND=noninteractive apt-get update -o Acquire::ForceIPv4=true") >= 180
     assert installer._timeout_for_command("DEBIAN_FRONTEND=noninteractive apt-get install -y curl") >= 180
     assert installer._timeout_for_command("bash -c \"$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)\" @ install") >= 180
+
+
+def test_second_install_while_running_reuses_existing_job(client, auth_headers, db_session, monkeypatch):
+    patch_node_job_session(monkeypatch, db_session)
+    node = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "Install running", "ip_address": "203.0.113.23", "ssh_username": "root", "ssh_password": "secret"},
+    ).json()
+
+    async def slow_install(self):
+        await asyncio.sleep(0.25)
+        return InstallResult(ok=True, logs=[{"level": "info", "message": "done"}])
+
+    monkeypatch.setattr(XrayInstaller, "install", slow_install)
+    first = client.post(f"/admin/nodes/{node['id']}/install", headers=auth_headers)
+    second = client.post(f"/admin/nodes/{node['id']}/install", headers=auth_headers)
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert second.json()["job_id"] == first.json()["job_id"]
+    assert wait_node_job(client, auth_headers, first.json()["job_id"])["status"] == "success"
 
 
 def test_apply_config_plan_does_not_reinstall_binary(client, auth_headers):

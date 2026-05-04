@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
@@ -70,10 +71,11 @@ class InstallResult:
 
 
 class XrayInstaller:
-    def __init__(self, node: VpsNode, users: list[VpnUser] | None = None) -> None:
+    def __init__(self, node: VpsNode, users: list[VpnUser] | None = None, progress_callback: Callable[[dict], None] | None = None) -> None:
         self.node = node
         self.users = users or []
         self.logs: list[CommandLog] = []
+        self.progress_callback = progress_callback
 
     async def check_connection(self) -> InstallResult:
         try:
@@ -375,18 +377,19 @@ class XrayInstaller:
         exit_code: int | None = None,
         mutating: bool = False,
     ) -> None:
-        self.logs.append(
-            CommandLog(
-                at=datetime.now(timezone.utc),
-                level=level,
-                command=self._mask(command) if command else None,
-                message=self._mask(message),
-                stdout=self._mask(stdout)[-4000:] if stdout else None,
-                stderr=self._mask(stderr)[-4000:] if stderr else None,
-                exit_code=exit_code,
-                mutating=mutating,
-            )
+        entry = CommandLog(
+            at=datetime.now(timezone.utc),
+            level=level,
+            command=self._mask(command) if command else None,
+            message=self._mask(message),
+            stdout=self._mask(stdout)[-4000:] if stdout else None,
+            stderr=self._mask(stderr)[-4000:] if stderr else None,
+            exit_code=exit_code,
+            mutating=mutating,
         )
+        self.logs.append(entry)
+        if self.progress_callback:
+            self.progress_callback(entry.as_dict())
 
     def _result(self, ok: bool) -> InstallResult:
         self._log("info" if ok else "error", None, "Действие завершено успешно" if ok else "Действие завершилось ошибкой", mutating=False)

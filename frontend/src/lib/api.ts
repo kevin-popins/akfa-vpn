@@ -35,6 +35,25 @@ export type NodeRead = {
   apply_status?: ConfigApplySummary | null;
 };
 
+export type NodeActionJobAccepted = {
+  job_id: string;
+  status: string;
+  current_step: string;
+};
+
+export type NodeActionJob = {
+  job_id: string;
+  node_id: number;
+  action: string;
+  status: "pending" | "running" | "success" | "failed" | string;
+  current_step: string;
+  logs: Array<Record<string, unknown>>;
+  error?: string | null;
+  result?: NodeRead | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type NodeApplyResult = {
   node_id: number;
   node_name: string;
@@ -280,7 +299,9 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   }
   if (!response.ok) {
     const text = await response.text();
-    let message = text || `HTTP ${response.status}`;
+    let message = /^\s*<!doctype html/i.test(text) || /^\s*<html/i.test(text)
+      ? "Сервер не ответил вовремя. Проверьте статус установки в журнале."
+      : text || `HTTP ${response.status}`;
     try {
       const data = JSON.parse(text) as { detail?: unknown; message?: unknown; diagnostics?: unknown };
       const detail = data.detail;
@@ -363,6 +384,12 @@ export const api = {
   },
   nodeAction(id: number, action: "check" | "dry-run" | "install" | "verify") {
     return request<NodeRead>(`/admin/nodes/${id}/${action}`, { method: "POST" });
+  },
+  startNodeInstall(id: number) {
+    return request<NodeActionJobAccepted>(`/admin/nodes/${id}/install`, { method: "POST" });
+  },
+  nodeActionJob(jobId: string) {
+    return request<NodeActionJob>(`/admin/node-actions/${jobId}`);
   },
   applyConfig(id: number) {
     return request<NodeRead>(`/admin/nodes/${id}/apply-config`, { method: "POST" });
