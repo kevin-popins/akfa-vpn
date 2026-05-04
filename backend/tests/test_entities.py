@@ -257,6 +257,77 @@ def test_verify_endpoint_handles_failed_status(client, auth_headers, monkeypatch
     assert response.json()["install_log"][0]["exit_code"] == 3
 
 
+def test_install_failure_returns_error_and_does_not_mark_xray_installed(client, auth_headers, db_session, monkeypatch):
+    node = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "Install timeout", "ip_address": "203.0.113.20", "ssh_username": "root", "ssh_password": "secret"},
+    ).json()
+
+    async def fake_install(self):
+        return InstallResult(
+            ok=False,
+            logs=[
+                {
+                    "level": "error",
+                    "command": "DEBIAN_FRONTEND=noninteractive apt-get update -o Acquire::ForceIPv4=true",
+                    "message": "Таймаут выполнения SSH-команды",
+                    "stderr": "apt-get update превысил таймаут 180 секунд",
+                    "exit_code": 124,
+                    "mutating": True,
+                }
+            ],
+        )
+
+    monkeypatch.setattr(XrayInstaller, "install", fake_install)
+    response = client.post(f"/admin/nodes/{node['id']}/install", headers=auth_headers)
+    assert response.status_code == 502
+    assert "Установка Xray не завершена" in str(response.json()["detail"])
+
+    from app.models import VpsNode
+
+    saved = db_session.get(VpsNode, node["id"])
+    assert saved.status == "failed"
+    assert saved.xray_installed is False
+
+
+def test_install_success_marks_node_online(client, auth_headers, db_session, monkeypatch):
+    node = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "Install success", "ip_address": "203.0.113.21", "ssh_username": "root", "ssh_password": "secret"},
+    ).json()
+
+    async def fake_install(self):
+        return InstallResult(ok=True, logs=[{"level": "info", "message": "Действие завершено успешно"}])
+
+    monkeypatch.setattr(XrayInstaller, "install", fake_install)
+    response = client.post(f"/admin/nodes/{node['id']}/install", headers=auth_headers)
+    assert response.status_code == 200
+    assert response.json()["status"] == "online"
+    assert response.json()["xray_installed"] is True
+
+    from app.models import VpsNode
+
+    saved = db_session.get(VpsNode, node["id"])
+    assert saved.status == "online"
+    assert saved.xray_installed is True
+
+
+def test_install_commands_have_longer_timeouts(client, auth_headers):
+    node = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "Timeouts", "ip_address": "203.0.113.22", "ssh_username": "root", "ssh_password": "secret"},
+    ).json()
+    from app.models import VpsNode
+
+    installer = XrayInstaller(VpsNode(**{k: v for k, v in node.items() if k in {"name", "ip_address", "ssh_port", "ssh_username", "sni", "fingerprint", "vless_port", "public_host", "xray_config_path", "xray_service_name"}}))
+    assert installer._timeout_for_command("DEBIAN_FRONTEND=noninteractive apt-get update -o Acquire::ForceIPv4=true") >= 180
+    assert installer._timeout_for_command("DEBIAN_FRONTEND=noninteractive apt-get install -y curl") >= 180
+    assert installer._timeout_for_command("bash -c \"$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)\" @ install") >= 180
+
+
 def test_apply_config_plan_does_not_reinstall_binary(client, auth_headers):
     node = client.post(
         "/admin/nodes",

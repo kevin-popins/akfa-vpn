@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
 import asyncio
+import shlex
 
 import asyncssh
 
@@ -24,6 +25,14 @@ READ_ONLY_CHECK_COMMANDS = [
 
 SSH_CONNECT_TIMEOUT_SECONDS = 10
 SSH_COMMAND_TIMEOUT_SECONDS = 20
+SSH_REMOTE_KILL_AFTER_SECONDS = 10
+SSH_LOCAL_TIMEOUT_GRACE_SECONDS = 15
+SSH_APT_UPDATE_TIMEOUT_SECONDS = 180
+SSH_APT_INSTALL_TIMEOUT_SECONDS = 300
+SSH_XRAY_INSTALL_TIMEOUT_SECONDS = 420
+SSH_SERVICE_TIMEOUT_SECONDS = 60
+APT_LOCK_EXIT_CODE = 73
+APT_LOCK_MESSAGE = "На сервере уже выполняется apt/dpkg процесс. Дождитесь завершения или остановите его."
 
 
 @dataclass
@@ -134,6 +143,7 @@ class XrayInstaller:
         try:
             async with await self._connect() as conn:
                 self._log("info", None, "Начата реальная установка Xray. Только этот путь изменяет VPS.", mutating=True)
+                await self._exec(conn, self._apt_lock_check_command(), mutating=False)
                 for command in self._package_install_commands():
                     await self._exec(conn, command, mutating=True)
                 await self._exec(conn, f"mkdir -p {config_dir}", mutating=True)
@@ -206,7 +216,7 @@ class XrayInstaller:
     def install_plan_commands(self) -> list[str]:
         config_path = self.node.xray_config_path
         temp_config = "/tmp/akfa-xray-config-<timestamp>.json"
-        return self._package_install_commands() + [
+        return [self._apt_lock_check_command()] + self._package_install_commands() + [
             f"mkdir -p {PurePosixPath(config_path).parent}",
             f"cat > {temp_config} <AKFA_XRAY_CONFIG>",
             f"chown root:root {temp_config} || true",
@@ -241,10 +251,24 @@ class XrayInstaller:
 
     def _package_install_commands(self) -> list[str]:
         return [
-            "apt-get update",
-            "apt-get install -y curl unzip ca-certificates jq",
+            "DEBIAN_FRONTEND=noninteractive apt-get update -o Acquire::ForceIPv4=true",
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y curl unzip ca-certificates jq",
             "bash -c \"$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)\" @ install",
         ]
+
+    def _apt_lock_check_command(self) -> str:
+        lock_paths = "/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock"
+        return (
+            "if pgrep -x apt >/dev/null 2>&1 || pgrep -x apt-get >/dev/null 2>&1 || "
+            "pgrep -x dpkg >/dev/null 2>&1 || pgrep -x unattended-upgrade >/dev/null 2>&1; then "
+            "ps -eo pid,comm,args | grep -E '[a]pt|[d]pkg|[u]nattended' >&2; "
+            f"echo '{APT_LOCK_MESSAGE}' >&2; exit {APT_LOCK_EXIT_CODE}; fi; "
+            "if command -v fuser >/dev/null 2>&1 && fuser "
+            f"{lock_paths} >/dev/null 2>&1; then "
+            f"fuser -v {lock_paths} >&2 || true; "
+            f"echo '{APT_LOCK_MESSAGE}' >&2; exit {APT_LOCK_EXIT_CODE}; fi; "
+            "echo AKFA_APT_DPKG_OK"
+        )
 
     async def _connect(self) -> asyncssh.SSHClientConnection:
         password = decrypt_secret(self.node.encrypted_ssh_password)
@@ -272,15 +296,44 @@ class XrayInstaller:
         log_command: str | None = None,
     ):
         displayed = log_command or command
+        timeout_seconds = self._timeout_for_command(command)
+        remote_command = self._wrap_command_with_timeout(command, timeout_seconds)
         self._log("info", displayed, "Выполняется команда", mutating=mutating)
         try:
             result = await asyncio.wait_for(
-                conn.run(command, input=input_data, check=False),
-                timeout=SSH_COMMAND_TIMEOUT_SECONDS,
+                conn.run(remote_command, input=input_data, check=False),
+                timeout=timeout_seconds + SSH_LOCAL_TIMEOUT_GRACE_SECONDS,
             )
         except TimeoutError as exc:
-            self._log("error", displayed, "Таймаут выполнения SSH-команды", stderr=f"{SSH_COMMAND_TIMEOUT_SECONDS}s", mutating=mutating)
-            raise RuntimeError(f"Таймаут выполнения команды: {displayed}") from exc
+            self._log("error", displayed, "Таймаут выполнения SSH-команды, SSH-канал закрывается", stderr=f"{timeout_seconds}s", mutating=mutating)
+            conn.close()
+            try:
+                await asyncio.wait_for(conn.wait_closed(), timeout=5)
+            except Exception:
+                conn.abort()
+            raise RuntimeError(f"{displayed} превысил таймаут {timeout_seconds} секунд") from exc
+        if result.exit_status in {124, 137}:
+            self._log(
+                "error",
+                displayed,
+                "Таймаут выполнения SSH-команды",
+                stdout=result.stdout,
+                stderr=f"{displayed} превысил таймаут {timeout_seconds} секунд\n{result.stderr or ''}".strip(),
+                exit_code=result.exit_status,
+                mutating=mutating,
+            )
+            raise RuntimeError(f"{displayed} превысил таймаут {timeout_seconds} секунд")
+        if result.exit_status == APT_LOCK_EXIT_CODE:
+            self._log(
+                "error",
+                displayed,
+                APT_LOCK_MESSAGE,
+                stdout=result.stdout,
+                stderr=result.stderr or APT_LOCK_MESSAGE,
+                exit_code=result.exit_status,
+                mutating=mutating,
+            )
+            raise RuntimeError(APT_LOCK_MESSAGE)
         self._log(
             "info" if result.exit_status == 0 else "error",
             displayed,
@@ -293,6 +346,24 @@ class XrayInstaller:
         if result.exit_status != 0 and not allow_failure:
             raise RuntimeError(f"Команда завершилась с ошибкой: {displayed}")
         return result
+
+    def _timeout_for_command(self, command: str) -> int:
+        stripped = command.strip()
+        if "apt-get update" in stripped:
+            return SSH_APT_UPDATE_TIMEOUT_SECONDS
+        if "apt-get install" in stripped:
+            return SSH_APT_INSTALL_TIMEOUT_SECONDS
+        if "install-release.sh" in stripped:
+            return SSH_XRAY_INSTALL_TIMEOUT_SECONDS
+        if "systemctl restart" in stripped or "systemctl enable" in stripped or "systemctl status" in stripped:
+            return SSH_SERVICE_TIMEOUT_SECONDS
+        if "xray run -test" in stripped:
+            return SSH_SERVICE_TIMEOUT_SECONDS
+        return SSH_COMMAND_TIMEOUT_SECONDS
+
+    def _wrap_command_with_timeout(self, command: str, timeout_seconds: int) -> str:
+        quoted = shlex.quote(command)
+        return f"timeout --kill-after={SSH_REMOTE_KILL_AFTER_SECONDS}s {timeout_seconds}s bash -lc {quoted}"
 
     def _log(
         self,
@@ -318,6 +389,7 @@ class XrayInstaller:
         )
 
     def _result(self, ok: bool) -> InstallResult:
+        self._log("info" if ok else "error", None, "Действие завершено успешно" if ok else "Действие завершилось ошибкой", mutating=False)
         return InstallResult(
             ok=ok,
             logs=[entry.as_dict() for entry in self.logs],

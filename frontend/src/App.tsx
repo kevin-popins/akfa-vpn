@@ -419,8 +419,10 @@ function AdminPages({
   const [selectedNode, setSelectedNode] = useState<NodeRead | null>(null);
   const [selectedProfile, setSelectedProfile] = useState<AccessProfile | null>(null);
   const [operation, setOperation] = useState<OperationState>(null);
+  const [nodeActionPending, setNodeActionPending] = useState<{ nodeId: number; action: NodeAction } | null>(null);
   const [deletingUserIds, setDeletingUserIds] = useState<Set<number>>(new Set());
   const deletingUserIdsRef = useRef<Set<number>>(new Set());
+  const nodeActionInFlightRef = useRef(false);
   const [preview, setPreview] = useState<PreviewState>({
     title: "Предпросмотр подписки",
     empty: "Подписка появится после создания активного пользователя и сервера.",
@@ -561,14 +563,37 @@ function AdminPages({
   }
 
   async function runNodeActionUnsafe(action: NodeAction, node: NodeRead) {
+    if (nodeActionInFlightRef.current) {
+      setOperation({ title: "Действие с Xray", message: "Операция уже выполняется.", tone: "warning" });
+      return;
+    }
+    nodeActionInFlightRef.current = true;
+    setNodeActionPending({ nodeId: node.id, action });
+    const timers: number[] = [];
+    const title = nodeActionTitle(action);
     try {
-      onNotice(action === "check" ? "Проверяю SSH-подключение..." : action === "dry-run" ? "Выполняю сухой запуск..." : action === "verify" ? "Проверяю состояние Xray..." : action === "apply-config" ? "Применяю конфиг Xray..." : "Запускаю установку Xray...");
+      setOperation({ title, message: nodeActionInitialMessage(action), tone: "pending" });
+      nodeActionStages(action).forEach(([delay, message]) => {
+        timers.push(window.setTimeout(() => setOperation({ title, message, tone: "pending" }), delay));
+      });
       const updated = action === "apply-config" ? await api.applyConfig(node.id) : await api.nodeAction(node.id, action);
       upsertNode(updated);
-      noticeWithApplyStatus(action === "check" ? "Проверка завершена" : action === "dry-run" ? "Сухой запуск завершен" : action === "verify" ? "Проверка Xray завершена" : action === "apply-config" ? "Конфиг Xray применен" : "Установка завершена", updated.apply_status);
+      const failedInstall = action === "install" && (!updated.xray_installed || updated.status !== "online");
+      if (failedInstall) {
+        const reason = nodeLogFailureReason(updated.install_log) || "установка не завершилась";
+        setOperation({ title, message: `Установка Xray не завершена: ${reason}`, tone: "error" });
+      } else {
+        setOperation({ title, message: nodeActionSuccessMessage(action, updated.apply_status), tone: applyStatusHasProblems(updated.apply_status) ? "warning" : "success" });
+      }
       await refresh();
     } catch (error) {
-      onNotice(error instanceof Error ? error.message : "Действие не выполнено");
+      const message = error instanceof Error ? error.message : "Действие не выполнено";
+      setOperation({ title, message: nodeActionErrorMessage(action, message), tone: "error" });
+      await refreshVisibleData("install-xray").catch(() => undefined);
+    } finally {
+      timers.forEach((timer) => window.clearTimeout(timer));
+      setNodeActionPending(null);
+      nodeActionInFlightRef.current = false;
     }
   }
 
@@ -722,6 +747,7 @@ function AdminPages({
       <ServerDetailPage
         node={selectedNode}
         onAction={runNodeAction}
+        pendingAction={nodeActionPending}
         onPreview={loadConfigPreview}
         onBack={() => setPage("servers")}
         onUpdated={async (node) => {
@@ -738,6 +764,7 @@ function AdminPages({
         node={selectedNode}
         onSelect={setSelectedNode}
         onAction={runNodeAction}
+        pendingAction={nodeActionPending}
         onAdd={() => setPage("add-server")}
       />
     ),
@@ -1297,6 +1324,7 @@ function AddServerPage({
 function ServerDetailPage({
   node,
   onAction,
+  pendingAction,
   onPreview,
   onBack,
   onUpdated,
@@ -1305,6 +1333,7 @@ function ServerDetailPage({
 }: {
   node: NodeRead | null;
   onAction: (action: NodeAction) => void;
+  pendingAction?: { nodeId: number; action: NodeAction } | null;
   onPreview: () => void;
   onBack: () => void;
   onUpdated: (node: NodeRead) => Promise<void>;
@@ -1333,6 +1362,7 @@ function ServerDetailPage({
   if (!node) {
     return <EmptyPanel title="Сервер не выбран" text="Откройте список серверов и выберите VPS для просмотра деталей." />;
   }
+  const nodeBusy = pendingAction?.nodeId === node.id;
 
   function update(key: string, value: string | number) {
     setForm((current) => ({ ...current, [key]: value }));
@@ -1390,13 +1420,13 @@ function ServerDetailPage({
       <Card>
         <CardHeader><h2 className="font-semibold">Действия</h2></CardHeader>
         <CardContent className="grid gap-2">
-          <Button variant="secondary" onClick={() => onAction("check")}>Проверить подключение</Button>
-          <Button variant="secondary" onClick={() => onAction("verify")}><ShieldCheck size={16} />Проверить состояние Xray</Button>
-          <Button variant="secondary" onClick={() => onAction("dry-run")}>Сухой запуск установки</Button>
-          <Button onClick={() => onAction(node.status === "online" ? "apply-config" : "install")}><Play size={16} />{node.status === "online" ? "Применить конфиг" : "Установить Xray"}</Button>
-          <Button variant="secondary" onClick={() => setEditing((value) => !value)}><Save size={16} />Редактировать</Button>
-          <Button variant="ghost" onClick={onPreview}><FileJson size={16} />Предпросмотр конфига</Button>
-          {onDelete ? <Button variant="danger" onClick={onDelete}><Trash2 size={16} />Удалить сервер</Button> : null}
+          <Button variant="secondary" disabled={nodeBusy} onClick={() => onAction("check")}>Проверить подключение</Button>
+          <Button variant="secondary" disabled={nodeBusy} onClick={() => onAction("verify")}><ShieldCheck size={16} />Проверить состояние Xray</Button>
+          <Button variant="secondary" disabled={nodeBusy} onClick={() => onAction("dry-run")}>Сухой запуск установки</Button>
+          <Button disabled={nodeBusy} onClick={() => onAction(node.status === "online" ? "apply-config" : "install")}><Play size={16} />{nodeBusy ? "Выполняется..." : node.status === "online" ? "Применить конфиг" : "Установить Xray"}</Button>
+          <Button variant="secondary" disabled={nodeBusy} onClick={() => setEditing((value) => !value)}><Save size={16} />Редактировать</Button>
+          <Button variant="ghost" disabled={nodeBusy} onClick={onPreview}><FileJson size={16} />Предпросмотр конфига</Button>
+          {onDelete ? <Button variant="danger" disabled={nodeBusy} onClick={onDelete}><Trash2 size={16} />Удалить сервер</Button> : null}
         </CardContent>
       </Card>
       {editing ? (
@@ -1455,12 +1485,14 @@ function InstallWizardPage({
   node,
   onSelect,
   onAction,
+  pendingAction,
   onAdd
 }: {
   nodes: NodeRead[];
   node: NodeRead | null;
   onSelect: (node: NodeRead) => void;
   onAction: (action: NodeAction) => void;
+  pendingAction?: { nodeId: number; action: NodeAction } | null;
   onAdd: () => void;
 }) {
   if (!nodes.length) {
@@ -1472,35 +1504,38 @@ function InstallWizardPage({
       />
     );
   }
+  const nodeBusy = Boolean(node && pendingAction?.nodeId === node.id);
   return (
-    <div className="grid gap-5">
+    <div className="grid min-w-0 gap-5">
       <PageHeader
         title="Установка Xray"
         description="Проверьте SSH, выполните сухой запуск и только затем запустите реальную установку."
       />
       <Card>
-        <CardContent className="grid gap-4 lg:grid-cols-[360px_1fr]">
-          <Field label="Выберите VPS-ноду">
-            <Select
-              value={node?.id || ""}
-              onChange={(event) => {
-                const found = nodes.find((item) => item.id === Number(event.target.value));
-                if (found) onSelect(found);
-              }}
-            >
-              {nodes.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.ip_address}</option>)}
-            </Select>
-          </Field>
+        <CardContent className="grid gap-4">
+          <div className="max-w-full lg:max-w-md">
+            <Field label="Выберите VPS-ноду">
+              <Select
+                value={node?.id || ""}
+                onChange={(event) => {
+                  const found = nodes.find((item) => item.id === Number(event.target.value));
+                  if (found) onSelect(found);
+                }}
+              >
+                {nodes.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.ip_address}</option>)}
+              </Select>
+            </Field>
+          </div>
           {node ? (
-            <div className="grid gap-2 rounded-md border border-akfa-line bg-akfa-soft p-3 text-sm md:grid-cols-4">
-              <Line k="VPS IP" v={node.ip_address} />
-              <Line k="VLESS port" v={node.vless_port} />
-              <Line k="SNI / Reality target" v={node.sni} />
-              <Line k="Fingerprint" v={node.fingerprint} />
-              <Line k="Flow" v="xtls-rprx-vision" />
-              <Line k="Security" v="reality" />
-              <Line k="Network" v="tcp" />
-              <Line k="Статус" v={translateStatus(node.status)} />
+            <div className="grid min-w-0 gap-2 rounded-md border border-akfa-line bg-akfa-soft p-3 text-sm sm:grid-cols-2 xl:grid-cols-4">
+              <InfoTile label="VPS IP" value={node.ip_address} />
+              <InfoTile label="VLESS port" value={node.vless_port} />
+              <InfoTile label="SNI / Reality target" value={node.sni} />
+              <InfoTile label="Fingerprint" value={node.fingerprint} />
+              <InfoTile label="Flow" value="xtls-rprx-vision" />
+              <InfoTile label="Security" value="reality" />
+              <InfoTile label="Network" value="tcp" />
+              <InfoTile label="Статус" value={translateStatus(node.status)} />
             </div>
           ) : null}
         </CardContent>
@@ -1510,26 +1545,26 @@ function InstallWizardPage({
           step="1"
           title="Проверить подключение"
           text="Проверяет SSH-доступ без вывода пароля и без установки пакетов."
-          action={<Button variant="secondary" disabled={!node} onClick={() => onAction("check")}><ShieldCheck size={16} />Проверить</Button>}
+          action={<Button variant="secondary" disabled={!node || nodeBusy} onClick={() => onAction("check")}><ShieldCheck size={16} />Проверить</Button>}
         />
         <StepCard
           step="2"
           title="Сухой запуск"
           text="Генерирует команды и конфиг, чтобы увидеть будущие действия без изменения сервера."
-          action={<Button variant="secondary" disabled={!node} onClick={() => onAction("dry-run")}><FileJson size={16} />Сухой запуск</Button>}
+          action={<Button variant="secondary" disabled={!node || nodeBusy} onClick={() => onAction("dry-run")}><FileJson size={16} />Сухой запуск</Button>}
         />
         <StepCard
           step="3"
           title={node?.status === "online" ? "Применить конфиг" : "Установить Xray"}
           text={node?.status === "online" ? "Обновляет Xray config без переустановки бинарника и перезапускает сервис." : "Выполняет установку на VPS. Перед запуском появится подтверждение."}
-          action={<Button disabled={!node} onClick={() => onAction(node?.status === "online" ? "apply-config" : "install")}><Play size={16} />{node?.status === "online" ? "Применить конфиг" : "Установить Xray"}</Button>}
+          action={<Button disabled={!node || nodeBusy} onClick={() => onAction(node?.status === "online" ? "apply-config" : "install")}><Play size={16} />{nodeBusy ? "Выполняется..." : node?.status === "online" ? "Применить конфиг" : "Установить Xray"}</Button>}
           warning
         />
       </div>
       <Card>
         <CardHeader className="flex flex-row items-center justify-between">
           <h2 className="font-semibold">Журнал команд</h2>
-          <Button variant="secondary" disabled={!node} onClick={() => onAction("verify")}><ShieldCheck size={16} />Проверить состояние Xray</Button>
+          <Button variant="secondary" disabled={!node || nodeBusy} onClick={() => onAction("verify")}><ShieldCheck size={16} />Проверить состояние Xray</Button>
         </CardHeader>
         <CardContent className="grid gap-4">
           {node ? <XrayStatusPanel logs={node.install_log} port={node.vless_port} /> : null}
@@ -1665,14 +1700,14 @@ function ProfilesPage({
   onSeed: () => void;
 }) {
   return (
-    <div className="grid gap-5">
+    <div className="grid min-w-0 gap-5">
       <PageHeader
         title="Профили доступа"
         description="Маршрутизация, лимиты, срок действия и шаблон клиентской конфигурации."
         action={<div className="flex flex-wrap gap-2"><Button variant="secondary" onClick={onSeed}>Базовые профили</Button><Button onClick={onNew}><Plus size={16} />Новый профиль</Button></div>}
       />
-      <Card>
-        <CardContent>
+      <Card className="max-w-full overflow-hidden">
+        <CardContent className="min-w-0">
           {!items.length ? (
             <EmptyPanel
               title="Профили доступа пока не созданы"
@@ -1680,36 +1715,40 @@ function ProfilesPage({
               action={<Button onClick={onSeed}>Создать базовые профили</Button>}
             />
           ) : (
-            <Table>
-              <thead>
-                <tr className="border-b border-akfa-line text-akfa-muted">
-                  <th className="py-2">Название</th>
-                  <th>Режим маршрутизации</th>
-                  <th>Лимит</th>
-                  <th>Срок</th>
-                  <th>Шаблон</th>
-                  <th className="text-right">Действия</th>
-                </tr>
-              </thead>
-              <tbody>
-                {items.map((item) => (
-                  <tr key={item.id} className="border-b border-akfa-line last:border-0">
-                    <td className="py-3">
-                      <div className="font-medium">{item.name}</div>
-                      <div className="text-xs text-akfa-muted">{item.description || "Описание не указано"}</div>
-                    </td>
-                    <td><StatusBadge value={item.routing_mode} /></td>
-                    <td>{item.traffic_limit_bytes ? formatBytes(item.traffic_limit_bytes) : "Без лимита"}</td>
-                    <td>{item.expires_in_days ? `${item.expires_in_days} дн.` : "Без срока"}</td>
-                    <td><StatusBadge value={item.client_template} /></td>
-                    <td className="flex justify-end gap-2 py-2">
-                      <Button variant="secondary" onClick={() => onEdit(item)}>Редактировать</Button>
-                      <Button variant="danger" onClick={() => onDelete(item)}><Trash2 size={15} />Удалить</Button>
-                    </td>
+            <div className="w-full max-w-full overflow-x-auto rounded-md border border-akfa-line">
+              <Table className="min-w-[780px]">
+                <thead>
+                  <tr className="border-b border-akfa-line text-akfa-muted">
+                    <th className="py-2 pl-3 pr-4">Название</th>
+                    <th className="px-3">Режим маршрутизации</th>
+                    <th className="px-3">Лимит</th>
+                    <th className="px-3">Срок</th>
+                    <th className="px-3">Шаблон</th>
+                    <th className="px-3 text-right">Действия</th>
                   </tr>
-                ))}
-              </tbody>
-            </Table>
+                </thead>
+                <tbody>
+                  {items.map((item) => (
+                    <tr key={item.id} className="border-b border-akfa-line last:border-0">
+                      <td className="py-3 pl-3 pr-4">
+                        <div className="font-medium">{item.name}</div>
+                        <div className="text-xs text-akfa-muted">{item.description || "Описание не указано"}</div>
+                      </td>
+                      <td className="px-3"><StatusBadge value={item.routing_mode} /></td>
+                      <td className="whitespace-nowrap px-3">{item.traffic_limit_bytes ? formatBytes(item.traffic_limit_bytes) : "Без лимита"}</td>
+                      <td className="whitespace-nowrap px-3">{item.expires_in_days ? `${item.expires_in_days} дн.` : "Без срока"}</td>
+                      <td className="px-3"><StatusBadge value={item.client_template} /></td>
+                      <td className="px-3 py-2 text-right">
+                        <div className="flex justify-end gap-2 whitespace-nowrap">
+                          <Button variant="secondary" onClick={() => onEdit(item)}>Редактировать</Button>
+                          <Button variant="danger" onClick={() => onDelete(item)}><Trash2 size={15} />Удалить</Button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </Table>
+            </div>
           )}
         </CardContent>
       </Card>
@@ -1955,9 +1994,9 @@ function UsersPage({
   });
 
   return (
-    <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_320px] 2xl:grid-cols-[minmax(0,1fr)_340px]">
+    <div className="grid min-w-0 items-start gap-5 2xl:grid-cols-[minmax(0,1fr)_minmax(320px,360px)]">
       <PageHeader title="Пользователи VPN" description="Создание доступов, подписки, статусы и лимиты трафика." />
-      <Card className="overflow-hidden">
+      <Card className="min-w-0 max-w-full overflow-hidden">
         <CardHeader className="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
           <div>
             <h2 className="font-semibold">Список пользователей</h2>
@@ -1965,7 +2004,7 @@ function UsersPage({
           </div>
         </CardHeader>
         <CardContent className="grid gap-3 px-4 py-3">
-          <div className="grid items-center gap-2 lg:grid-cols-[minmax(260px,1fr)_150px_180px_auto]">
+          <div className="grid min-w-0 items-center gap-2 lg:grid-cols-[minmax(220px,1fr)_150px_180px_auto]">
             <Input className="h-9" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Поиск по имени, логину или отделу" />
             <Select className="h-9" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
               <option value="">Все статусы</option>
@@ -1998,7 +2037,7 @@ function UsersPage({
                       {group.users.length} пользователей · активных {group.users.filter((user) => user.status === "active").length} · {formatBytes(group.users.reduce((sum, user) => sum + user.used_total_bytes, 0))}
                     </span>
                   </summary>
-                  <div className="p-2">
+                  <div className="min-w-0 p-2">
               <UsersTable users={group.users} departments={departments} profiles={profiles} onSelect={onSelect} onDelete={onDelete} deletingUserIds={deletingUserIds} />
                   </div>
                 </details>
@@ -2006,13 +2045,13 @@ function UsersPage({
               </div>
             )
           ) : (
-            <div className="w-full">
+            <div className="min-w-0 max-w-full">
               <UsersTable users={filteredUsers} departments={departments} profiles={profiles} onSelect={onSelect} onDelete={onDelete} deletingUserIds={deletingUserIds} />
             </div>
           )}
         </CardContent>
       </Card>
-      <Card className="xl:sticky xl:top-20">
+      <Card className="w-full max-w-full 2xl:sticky 2xl:top-20">
         <CardHeader className="px-4 py-3">
           <h2 className="font-semibold">Новый пользователь</h2>
           <p className="mt-1 text-xs text-akfa-muted">Быстрое создание VPN-доступа</p>
@@ -2088,7 +2127,7 @@ function UsersTable({
 }) {
   if (!users.length) return <EmptyPanel title="Ничего не найдено" text="Измените поиск или фильтры." />;
   return (
-    <div className="overflow-x-auto rounded-md border border-akfa-line">
+    <div className="w-full max-w-full overflow-x-auto rounded-md border border-akfa-line">
       <Table className="min-w-[960px] table-fixed">
         <thead className="bg-zinc-50">
           <tr className="border-b border-akfa-line text-xs font-semibold text-akfa-muted">
@@ -3142,6 +3181,17 @@ function Line({ k, v }: { k: string; v: string | number }) {
   );
 }
 
+function InfoTile({ label, value }: { label: string; value: string | number }) {
+  return (
+    <div className="min-w-0 rounded-md border border-akfa-line bg-white px-3 py-2">
+      <div className="text-xs text-akfa-muted">{label}</div>
+      <div className="mt-1 min-w-0 break-words text-sm font-medium leading-snug" title={String(value)}>
+        {value}
+      </div>
+    </div>
+  );
+}
+
 function EmptyPanel({ title, text, action }: { title: string; text: string; action?: JSX.Element }) {
   return (
     <div className="rounded-md border border-dashed border-akfa-line bg-akfa-soft p-6">
@@ -3425,6 +3475,73 @@ function formatApplyStatusMessage(base: string, applyStatus?: ConfigApplySummary
 
 function applyStatusHasProblems(applyStatus?: ConfigApplySummary | null) {
   return Boolean(applyStatus?.results.some((item) => !item.ok || item.status === "skipped"));
+}
+
+function nodeActionTitle(action: NodeAction) {
+  if (action === "install") return "Установка Xray";
+  if (action === "apply-config") return "Применение конфига Xray";
+  if (action === "dry-run") return "Сухой запуск установки";
+  if (action === "verify") return "Проверка Xray";
+  return "Проверка SSH";
+}
+
+function nodeActionInitialMessage(action: NodeAction) {
+  if (action === "install") return "Подключаемся к VPS...";
+  if (action === "apply-config") return "Готовим и применяем конфигурацию...";
+  if (action === "dry-run") return "Формируем план установки...";
+  if (action === "verify") return "Проверяем статус ноды...";
+  return "Проверяем SSH-подключение...";
+}
+
+function nodeActionStages(action: NodeAction): Array<[number, string]> {
+  if (action === "install") {
+    return [
+      [1200, "Проверяем apt/dpkg..."],
+      [3500, "Обновляем пакеты..."],
+      [12000, "Устанавливаем зависимости..."],
+      [25000, "Скачиваем и устанавливаем Xray..."],
+      [45000, "Генерируем Reality config..."],
+      [55000, "Проверяем конфигурацию Xray..."],
+      [65000, "Запускаем Xray service..."],
+      [75000, "Проверяем статус ноды..."]
+    ];
+  }
+  if (action === "apply-config") {
+    return [
+      [1200, "Генерируем Reality config..."],
+      [3000, "Проверяем конфигурацию Xray..."],
+      [6000, "Перезапускаем Xray service..."]
+    ];
+  }
+  return [];
+}
+
+function nodeActionSuccessMessage(action: NodeAction, applyStatus?: ConfigApplySummary | null) {
+  const base =
+    action === "install"
+      ? "Установка Xray завершена"
+      : action === "apply-config"
+        ? "Конфиг Xray применен"
+        : action === "dry-run"
+          ? "Сухой запуск завершен"
+          : action === "verify"
+            ? "Проверка Xray завершена"
+            : "Проверка SSH завершена";
+  return formatApplyStatusMessage(base, applyStatus);
+}
+
+function nodeActionErrorMessage(action: NodeAction, message: string) {
+  if (action === "install") return message.startsWith("Установка Xray не завершена") ? message : `Установка Xray не завершена: ${message}`;
+  if (action === "apply-config") return `Конфиг Xray не применен: ${message}`;
+  if (action === "dry-run") return `Сухой запуск не выполнен: ${message}`;
+  if (action === "verify") return `Проверка Xray не выполнена: ${message}`;
+  return `Проверка SSH не выполнена: ${message}`;
+}
+
+function nodeLogFailureReason(logs: Array<Record<string, unknown>>) {
+  const entry = [...(logs || [])].reverse().find((log) => log.level === "error");
+  if (!entry) return "";
+  return [entry.message, entry.command, entry.stderr].map((value) => String(value || "").trim()).filter(Boolean).join(" · ");
 }
 
 function downloadText(filename: string, value: string) {

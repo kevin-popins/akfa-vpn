@@ -31,7 +31,7 @@ export function Select({ className, ...props }: SelectHTMLAttributes<HTMLSelectE
 
 export function Field({ label, children, hint, error }: { label: string; children: ReactNode; hint?: string; error?: string }) {
   return (
-    <label className="grid gap-1.5 text-sm font-medium text-akfa-ink">
+    <label className="grid min-w-0 gap-1.5 text-sm font-medium text-akfa-ink">
       <span>{label}</span>
       {children}
       {error ? <span className="text-xs font-normal text-akfa-red">{error}</span> : null}

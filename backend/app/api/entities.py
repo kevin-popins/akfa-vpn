@@ -109,6 +109,21 @@ def attach_apply_status(item: object, summary: ConfigApplySummary | None) -> obj
     return item
 
 
+def install_failure_reason(logs: list[dict]) -> str:
+    for entry in reversed(logs or []):
+        if entry.get("level") != "error":
+            continue
+        parts = [
+            str(entry.get("message") or "").strip(),
+            str(entry.get("command") or "").strip(),
+            str(entry.get("stderr") or "").strip(),
+        ]
+        reason = " · ".join(part for part in parts if part)
+        if reason:
+            return reason
+    return "Не удалось завершить установку Xray"
+
+
 def apply_warning(prefix: str, summary: ConfigApplySummary | None) -> str | None:
     if not summary or summary.failed == 0:
         return None
@@ -442,13 +457,26 @@ async def install_node(node_id: int, admin: Admin = Depends(require_write), db: 
     node.install_log = result.logs
     node.status = NodeStatus.online.value if result.ok else NodeStatus.failed.value
     node.xray_installed = bool(result.ok)
-    node.managed_mode = NodeManagedMode.akfa_owned.value
+    if result.ok:
+        node.managed_mode = NodeManagedMode.akfa_owned.value
     node.reality_private_key = result.reality_private_key or node.reality_private_key
     node.reality_public_key = result.reality_public_key or node.reality_public_key
     node.short_id = result.short_id or node.short_id
     node.last_check_at = datetime.now(timezone.utc)
     audit(db, "install_xray", "vps_node", node.id, admin.id)
     db.commit()
+    if not result.ok:
+        reason = install_failure_reason(result.logs)
+        logger.error("install_xray failed node_id=%s reason=%s", node.id, reason)
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": f"Установка Xray не завершена: {reason}",
+                "node_id": node.id,
+                "status": node.status,
+                "install_log": result.logs[-8:],
+            },
+        )
     return node
 
 

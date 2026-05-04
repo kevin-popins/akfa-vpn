@@ -286,6 +286,8 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
       const detail = data.detail;
       if (typeof detail === "string") {
         message = detail;
+      } else if (detail && typeof detail === "object" && "message" in detail) {
+        message = String((detail as { message?: unknown }).message || message);
       } else if (Array.isArray(detail)) {
         message = detail
           .map((item) => {
