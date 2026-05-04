@@ -275,8 +275,24 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     const text = await response.text();
     let message = text || `HTTP ${response.status}`;
     try {
-      const data = JSON.parse(text) as { detail?: string };
-      message = data.detail || message;
+      const data = JSON.parse(text) as { detail?: unknown; message?: unknown; diagnostics?: unknown };
+      const detail = data.detail;
+      if (typeof detail === "string") {
+        message = detail;
+      } else if (Array.isArray(detail)) {
+        message = detail
+          .map((item) => {
+            if (typeof item === "string") return item;
+            if (item && typeof item === "object" && "msg" in item) return String((item as { msg?: unknown }).msg || "");
+            return "";
+          })
+          .filter(Boolean)
+          .join("; ") || message;
+      } else if (typeof data.message === "string") {
+        message = data.message;
+      } else if (typeof data.diagnostics === "string") {
+        message = data.diagnostics;
+      }
     } catch {
       // Keep the original response body if it is not JSON.
     }

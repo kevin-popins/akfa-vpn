@@ -62,9 +62,11 @@ from app.services.reality import check_sni_target, ensure_reality_credentials
 from app.services.audit import audit
 from app.services.backup import build_backup_archive, restore_backup_archive
 from app.services.config_apply import (
+    APPLY_FAILED,
     ConfigApplyRequiredError,
     ConfigApplyService,
     ConfigApplySummary,
+    NodeApplyResult,
     affected_node_ids_for_user,
     apply_config_for_user,
 )
@@ -140,6 +142,61 @@ async def auto_apply_after_change(
     reason: str,
 ) -> ConfigApplySummary:
     return await ConfigApplyService(db, admin.id).apply_to_nodes(node_ids, reason=reason)
+
+
+def failed_apply_summary_from_exception(db: Session, node_ids: set[int] | None, error: Exception) -> ConfigApplySummary:
+    ids = set(node_ids or [])
+    nodes = list(db.scalars(select(VpsNode).where(VpsNode.id.in_(ids)).order_by(VpsNode.name, VpsNode.id))) if ids else []
+    message = str(error) or "Не удалось применить конфигурацию на сервер"
+    applied_at = datetime.now(timezone.utc).isoformat()
+    results = [
+        NodeApplyResult(
+            node_id=node.id,
+            node_name=node.name,
+            ok=False,
+            status=APPLY_FAILED,
+            error=message,
+            applied_at=applied_at,
+        )
+        for node in nodes
+    ]
+    if not results:
+        results.append(
+            NodeApplyResult(
+                node_id=0,
+                node_name="Xray config",
+                ok=False,
+                status=APPLY_FAILED,
+                error=message,
+                applied_at=applied_at,
+            )
+        )
+    return ConfigApplySummary(
+        ok=False,
+        attempted=len(results),
+        succeeded=0,
+        failed=len(results),
+        skipped=0,
+        results=results,
+    )
+
+
+async def safe_auto_apply_after_change(
+    db: Session,
+    admin: Admin,
+    node_ids: set[int] | None,
+    reason: str,
+) -> ConfigApplySummary:
+    try:
+        return await auto_apply_after_change(db, admin, node_ids, reason)
+    except Exception as exc:
+        logger.exception(
+            "auto apply failed with unhandled exception admin_id=%s reason=%s nodes=%s",
+            admin.id,
+            reason,
+            sorted(node_ids or []),
+        )
+        return failed_apply_summary_from_exception(db, node_ids, exc)
 
 
 @router.get("/dashboard", response_model=DashboardStats)
@@ -479,7 +536,7 @@ async def create_user(payload: VpnUserCreate, admin: Admin = Depends(require_wri
     db.flush()
     _, new_ids = set_user_node_access(db, user, allowed_node_ids, payload.primary_node_id)
     audit(db, "create", "vpn_user", user.id, admin.id)
-    summary = await auto_apply_after_change(db, admin, new_ids, "auto_apply_after_user_create")
+    summary = await safe_auto_apply_after_change(db, admin, new_ids, "auto_apply_after_user_create")
     db.commit()
     return attach_apply_status(user, summary)
 
@@ -507,7 +564,7 @@ async def update_user(user_id: int, payload: VpnUserCreate, admin: Admin = Depen
         setattr(user, key, value)
     old_ids, new_ids = set_user_node_access(db, user, allowed_node_ids, payload.primary_node_id)
     audit(db, "update", "vpn_user", user.id, admin.id)
-    summary = await auto_apply_after_change(db, admin, old_ids | new_ids, "auto_apply_after_user_update")
+    summary = await safe_auto_apply_after_change(db, admin, old_ids | new_ids, "auto_apply_after_user_update")
     db.commit()
     return attach_apply_status(user, summary)
 

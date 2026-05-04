@@ -375,6 +375,101 @@ def test_user_create_persists_and_reports_apply_failure(client, auth_headers, db
     assert db_session.query(VpnUser).filter_by(username="bad.sync").first() is not None
 
 
+def test_user_create_reports_unhandled_apply_exception_as_warning(client, auth_headers, db_session, monkeypatch):
+    node_payload = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "Online exception", "ip_address": "203.0.113.32", "ssh_username": "root", "ssh_password": "secret"},
+    ).json()
+    from app.models import VpsNode, VpnUser
+    from app.services.config_apply import ConfigApplyService
+
+    node = db_session.get(VpsNode, node_payload["id"])
+    node.status = "online"
+    node.install_log = [{"message": "Начата реальная установка Xray"}]
+    db_session.commit()
+
+    async def broken_apply(self, *args, **kwargs):
+        raise RuntimeError("ssh timeout")
+
+    monkeypatch.setattr(ConfigApplyService, "apply_to_nodes", broken_apply)
+    response = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={"first_name": "Warn", "last_name": "Create", "username": "warn.create"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["username"] == "warn.create"
+    assert body["apply_status"]["ok"] is False
+    assert body["apply_status"]["failed"] == 1
+    assert "ssh timeout" in body["apply_status"]["results"][0]["error"]
+    assert db_session.query(VpnUser).filter_by(username="warn.create").first() is not None
+
+
+def test_user_update_validates_limit_and_reports_apply_status(client, auth_headers, db_session, monkeypatch):
+    node_payload = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "Update apply", "ip_address": "203.0.113.34", "ssh_username": "root", "ssh_password": "secret"},
+    ).json()
+    from app.models import VpnUserDevice, VpsNode
+
+    node = db_session.get(VpsNode, node_payload["id"])
+    node.status = "online"
+    node.install_log = [{"message": "Начата реальная установка Xray"}]
+    db_session.commit()
+    calls = []
+
+    async def fake_apply(self):
+        calls.append(self.node.id)
+        return InstallResult(ok=True, logs=[{"message": "applied"}])
+
+    monkeypatch.setattr(XrayInstaller, "apply_config", fake_apply)
+    user = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={"first_name": "Edit", "last_name": "User", "username": "edit.user", "device_limit": 3},
+    ).json()
+    client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "edit-device-1"})
+    client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "edit-device-2"})
+    assert db_session.query(VpnUserDevice).filter_by(vpn_user_id=user["id"], status="active").count() == 2
+
+    too_low = client.put(
+        f"/admin/users/{user['id']}",
+        headers=auth_headers,
+        json={**user, "device_limit": 1},
+    )
+    assert too_low.status_code == 400
+    assert too_low.json()["detail"] == "Нельзя установить лимит меньше текущего количества активных устройств."
+
+    updated = client.put(
+        f"/admin/users/{user['id']}",
+        headers=auth_headers,
+        json={
+            "first_name": "Edited",
+            "last_name": "Person",
+            "username": "edited.user",
+            "department_id": None,
+            "access_profile_id": None,
+            "traffic_limit_bytes": 1073741824,
+            "device_limit": 2,
+            "expires_at": None,
+            "status": "disabled",
+            "allowed_node_ids": [node.id],
+            "primary_node_id": node.id,
+        },
+    )
+    assert updated.status_code == 200
+    body = updated.json()
+    assert body["first_name"] == "Edited"
+    assert body["username"] == "edited.user"
+    assert body["device_limit"] == 2
+    assert body["status"] == "disabled"
+    assert body["apply_status"]["ok"] is True
+    assert calls
+
+
 def test_node_update_keeps_subscription_token_and_changes_vless_params(client, auth_headers, db_session, monkeypatch):
     from app.models import VpsNode
 

@@ -1828,7 +1828,7 @@ function UsersPage({
   nodes: NodeRead[];
   departments: Department[];
   profiles: AccessProfile[];
-  onCreated: (user: VpnUser) => void;
+  onCreated: (user: VpnUser) => void | Promise<void>;
   onSelect: (user: VpnUser) => void;
   onDelete: (user: VpnUser) => void;
   onNotice: (value: string) => void;
@@ -1838,6 +1838,7 @@ function UsersPage({
   const [statusFilter, setStatusFilter] = useState("");
   const [departmentFilter, setDepartmentFilter] = useState("");
   const [grouped, setGrouped] = useState(false);
+  const [creating, setCreating] = useState(false);
   const activeNodeIds = useMemo(() => nodes.filter((node) => node.status === "online").map((node) => node.id), [nodes]);
 
   useEffect(() => {
@@ -1858,14 +1859,23 @@ function UsersPage({
       onNotice("Выберите хотя бы один доступный сервер");
       return;
     }
+    if (creating) return;
     const payload = userPayload(form);
+    setCreating(true);
+    let applyTimer: number | null = null;
     try {
+      onNotice("Создаём пользователя...");
+      applyTimer = window.setTimeout(() => onNotice("Применяем конфигурацию..."), 250);
       const created = await api.createUser(payload);
+      if (applyTimer) window.clearTimeout(applyTimer);
       setForm({ ...defaultUserForm, allowed_node_ids: activeNodeIds, primary_node_id: activeNodeIds[0] ? String(activeNodeIds[0]) : "" });
-      onCreated(created);
-      onNotice(formatApplyStatusMessage("Пользователь создан", created.apply_status));
+      await onCreated(created);
+      onNotice(formatApplyStatusMessage("Пользователь успешно добавлен", created.apply_status, "Пользователь создан, но конфигурация не применена"));
     } catch (error) {
+      if (applyTimer) window.clearTimeout(applyTimer);
       onNotice(error instanceof Error ? error.message : "Пользователь не создан");
+    } finally {
+      setCreating(false);
     }
   }
   const visibleUserRows = visibleUsers(users);
@@ -1984,7 +1994,10 @@ function UsersPage({
             primaryNodeId={form.primary_node_id ? Number(form.primary_node_id) : null}
             onChange={(selectedIds, primaryNodeId) => setForm({ ...form, allowed_node_ids: selectedIds, primary_node_id: primaryNodeId ? String(primaryNodeId) : "" })}
           />
-          <Button className="mt-1 h-9" onClick={create}><UserPlus size={16} />Создать пользователя</Button>
+          <Button className="mt-1 h-9" onClick={create} disabled={creating}>
+            <UserPlus size={16} />
+            {creating ? "Создаём..." : "Создать пользователя"}
+          </Button>
         </CardContent>
       </Card>
     </div>
@@ -2134,7 +2147,7 @@ function UserDetailPage({
   departments: Department[];
   profiles: AccessProfile[];
   onDelete?: () => void;
-  onUpdated: (user: VpnUser) => void;
+  onUpdated: (user: VpnUser) => void | Promise<void>;
   onBack: () => void;
   onNotice: (value: string) => void;
 }) {
@@ -2142,6 +2155,8 @@ function UserDetailPage({
   const [vlessEntries, setVlessEntries] = useState<SubscriptionVlessUri[]>([]);
   const [devices, setDevices] = useState<VpnUserDevice[]>([]);
   const [nodeSelection, setNodeSelection] = useState<{ ids: number[]; primaryId: number | null }>({ ids: [], primaryId: null });
+  const [editForm, setEditForm] = useState(defaultUserForm);
+  const [savingUser, setSavingUser] = useState(false);
   const [activeTab, setActiveTab] = useState("Ссылка подписки");
   const [confirm, setConfirm] = useState<ConfirmState>(null);
 
@@ -2150,8 +2165,10 @@ function UserDetailPage({
       setAccessBlocks([]);
       setVlessEntries([]);
       setDevices([]);
+      setEditForm(defaultUserForm);
       return;
     }
+    setEditForm(userFormFromUser(user));
     setNodeSelection({ ids: user.allowed_node_ids || [], primaryId: user.primary_node_id || null });
     const connectUrl = absoluteUrl(`/connect/${user.subscription_token}`);
     setAccessBlocks([{ label: "Connect-ссылка", value: connectUrl }]);
@@ -2185,7 +2202,7 @@ function UserDetailPage({
   async function action(actionName: "enable" | "disable" | "regenerate-uuid" | "regenerate-subscription" | "reset-traffic", message: string) {
     try {
       const updated = await api.userAction(userId, actionName);
-      onUpdated(updated);
+      await onUpdated(updated);
       onNotice(formatApplyStatusMessage(message, updated.apply_status));
     } catch (error) {
       onNotice(error instanceof Error ? error.message : "Действие не выполнено");
@@ -2253,10 +2270,35 @@ function UserDetailPage({
         allowed_node_ids: nodeSelection.ids,
         primary_node_id: nodeSelection.primaryId
       });
-      onUpdated(updated);
+      await onUpdated(updated);
       onNotice(formatApplyStatusMessage("Доступные серверы сохранены", updated.apply_status));
     } catch (error) {
       onNotice(error instanceof Error ? error.message : "Серверы пользователя не сохранены");
+    }
+  }
+
+  async function saveUserSettings() {
+    if (!user || savingUser) return;
+    if (editForm.status === "active" && nodes.some((node) => node.status === "online") && !nodeSelection.ids.length) {
+      onNotice("Выберите хотя бы один доступный сервер");
+      return;
+    }
+    setSavingUser(true);
+    let applyTimer: number | null = null;
+    try {
+      onNotice("Сохраняем изменения...");
+      applyTimer = window.setTimeout(() => onNotice("Применяем конфигурацию..."), 250);
+      const updated = await api.updateUser(user.id, userPayload({ ...editForm, allowed_node_ids: nodeSelection.ids, primary_node_id: nodeSelection.primaryId ? String(nodeSelection.primaryId) : "" }));
+      if (applyTimer) window.clearTimeout(applyTimer);
+      setEditForm(userFormFromUser(updated));
+      setNodeSelection({ ids: updated.allowed_node_ids || [], primaryId: updated.primary_node_id || null });
+      await onUpdated(updated);
+      onNotice(formatApplyStatusMessage("Пользователь обновлён", updated.apply_status, "Пользователь обновлён, но конфигурация не применена"));
+    } catch (error) {
+      if (applyTimer) window.clearTimeout(applyTimer);
+      onNotice(error instanceof Error ? error.message : "Изменения не сохранены");
+    } finally {
+      setSavingUser(false);
     }
   }
 
@@ -2322,6 +2364,75 @@ function UserDetailPage({
           ) : null}
         </CardContent>
       </Card>
+      <Card>
+        <CardHeader>
+          <h2 className="font-semibold">Настройки пользователя</h2>
+          <p className="mt-1 text-xs text-akfa-muted">Основные параметры доступа, лимиты и доступные серверы.</p>
+        </CardHeader>
+        <CardContent className="grid gap-4">
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            <Field label="Имя">
+              <Input className="h-9" value={editForm.first_name} onChange={(event) => setEditForm({ ...editForm, first_name: event.target.value })} />
+            </Field>
+            <Field label="Фамилия">
+              <Input className="h-9" value={editForm.last_name} onChange={(event) => setEditForm({ ...editForm, last_name: event.target.value })} />
+            </Field>
+            <Field label="Логин">
+              <Input className="h-9" value={editForm.username} onChange={(event) => setEditForm({ ...editForm, username: event.target.value })} />
+            </Field>
+            <Field label="Отдел">
+              <Select className="h-9" value={editForm.department_id} onChange={(event) => setEditForm({ ...editForm, department_id: event.target.value })}>
+                <option value="">Не выбран</option>
+                {departments.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+              </Select>
+            </Field>
+            <Field label="Профиль доступа">
+              <Select className="h-9" value={editForm.access_profile_id} onChange={(event) => setEditForm({ ...editForm, access_profile_id: event.target.value })}>
+                <option value="">Не выбран</option>
+                {profiles.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+              </Select>
+            </Field>
+            <Field label="Статус">
+              <Select className="h-9" value={editForm.status} onChange={(event) => setEditForm({ ...editForm, status: event.target.value })}>
+                <option value="active">Активен</option>
+                <option value="disabled">Отключен</option>
+              </Select>
+            </Field>
+            <Field label="Количество устройств" hint={`Сейчас активно: ${user.active_devices_count || 0}`}>
+              <Input className="h-9" value={editForm.device_limit} onChange={(event) => setEditForm({ ...editForm, device_limit: event.target.value })} type="number" min={1} max={100} />
+            </Field>
+            <Field label="Лимит трафика" hint="ГБ. Пусто = без индивидуального лимита.">
+              <Input className="h-9" value={editForm.traffic_limit_gb} onChange={(event) => setEditForm({ ...editForm, traffic_limit_gb: event.target.value })} type="number" min={0} step="0.5" />
+            </Field>
+            <Field label="Срок действия">
+              <Input className="h-9" value={editForm.expires_at} onChange={(event) => setEditForm({ ...editForm, expires_at: event.target.value })} type="datetime-local" />
+            </Field>
+          </div>
+          <NodeAccessSelector
+            nodes={nodes}
+            selectedIds={nodeSelection.ids}
+            primaryNodeId={nodeSelection.primaryId}
+            onChange={(ids, primaryId) => setNodeSelection({ ids, primaryId })}
+          />
+          <div className="flex flex-wrap gap-2">
+            <Button onClick={saveUserSettings} disabled={savingUser}>
+              <Save size={16} />
+              {savingUser ? "Сохраняем..." : "Сохранить изменения"}
+            </Button>
+            <Button
+              variant="secondary"
+              disabled={savingUser}
+              onClick={() => {
+                setEditForm(userFormFromUser(user));
+                setNodeSelection({ ids: user.allowed_node_ids || [], primaryId: user.primary_node_id || null });
+              }}
+            >
+              <RotateCcw size={16} />
+              Отменить изменения
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
       <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
         <Card>
           <CardHeader><h2 className="font-semibold">Карточка пользователя</h2></CardHeader>
@@ -2343,18 +2454,6 @@ function UserDetailPage({
             <Line k="Токен подписки" v={tokenMasked} />
             <Line k="Лимит трафика" v={user.traffic_limit_bytes ? formatBytes(user.traffic_limit_bytes) : "Без лимита"} />
             <Line k="Последний прирост" v={formatBytes(user.last_seen_delta_bytes || 0)} />
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader><h2 className="font-semibold">Доступные серверы</h2></CardHeader>
-          <CardContent className="grid gap-3">
-            <NodeAccessSelector
-              nodes={nodes}
-              selectedIds={nodeSelection.ids}
-              primaryNodeId={nodeSelection.primaryId}
-              onChange={(ids, primaryId) => setNodeSelection({ ids, primaryId })}
-            />
-            <Button onClick={saveNodeAccess}><Save size={16} />Сохранить серверы</Button>
           </CardContent>
         </Card>
         <Card>
@@ -3134,6 +3233,33 @@ function userPayload(form: typeof defaultUserForm) {
   };
 }
 
+function userFormFromUser(user: VpnUser): typeof defaultUserForm {
+  return {
+    first_name: user.first_name || "",
+    last_name: user.last_name || "",
+    username: user.username || "",
+    department_id: user.department_id ? String(user.department_id) : "",
+    access_profile_id: user.access_profile_id ? String(user.access_profile_id) : "",
+    device_limit: String(user.device_limit || 5),
+    traffic_limit_gb: user.traffic_limit_bytes ? trimNumber((user.traffic_limit_bytes / 1024 / 1024 / 1024).toFixed(2)) : "",
+    expires_at: user.expires_at ? toDatetimeLocal(user.expires_at) : "",
+    status: user.status || "active",
+    allowed_node_ids: user.allowed_node_ids || [],
+    primary_node_id: user.primary_node_id ? String(user.primary_node_id) : ""
+  };
+}
+
+function trimNumber(value: string) {
+  return value.replace(/\.00$/, "").replace(/(\.\d)0$/, "$1");
+}
+
+function toDatetimeLocal(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const offsetMs = date.getTimezoneOffset() * 60 * 1000;
+  return new Date(date.getTime() - offsetMs).toISOString().slice(0, 16);
+}
+
 function groupUsersByDepartment(users: VpnUser[], departments: Department[]) {
   const map = new Map<string, VpnUser[]>();
   for (const user of users) {
@@ -3155,10 +3281,15 @@ function syncLabel(node: NodeRead) {
   return "Ожидает применения";
 }
 
-function formatApplyStatusMessage(base: string, applyStatus?: ConfigApplySummary | null) {
-  if (!applyStatus || applyStatus.failed === 0) return base;
-  const failedNodes = applyStatus.results.filter((item) => !item.ok).map((item) => item.node_name).join(", ");
-  return `${base}, но конфиг не применился${failedNodes ? ` на нодах: ${failedNodes}` : ""}`;
+function formatApplyStatusMessage(base: string, applyStatus?: ConfigApplySummary | null, partialBase?: string) {
+  if (!applyStatus) return base;
+  const problematic = applyStatus.results.filter((item) => !item.ok || item.status === "skipped");
+  if (!problematic.length) return base;
+  const details = problematic
+    .map((item) => [item.node_name, item.error].filter(Boolean).join(": "))
+    .filter(Boolean)
+    .join("; ");
+  return `${partialBase || `${base}, но конфиг не применился`}${details ? `: ${details}` : ""}`;
 }
 
 function downloadText(filename: string, value: string) {
