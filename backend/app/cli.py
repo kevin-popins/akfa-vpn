@@ -1,4 +1,5 @@
 import argparse
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 
@@ -23,6 +24,7 @@ def seed_admin(email: str, password: str, enable_totp: bool) -> None:
             totp_secret=new_totp_secret() if enable_totp else None,
             totp_enabled=enable_totp,
             totp_required=enable_totp,
+            totp_confirmed_at=datetime.now(timezone.utc) if enable_totp else None,
         )
         db.add(admin)
         seed_default_access_profiles(db)

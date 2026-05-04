@@ -72,6 +72,7 @@ class Admin(Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255))
     totp_secret: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    pending_totp_secret: Mapped[str | None] = mapped_column(String(64), nullable=True)
     totp_secret_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     totp_required: Mapped[bool] = mapped_column(Boolean, default=False)

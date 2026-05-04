@@ -164,7 +164,8 @@ function PublicConnectPage({ userToken }: { userToken: string }) {
         <header className="flex flex-wrap items-center justify-between gap-3 border-b border-akfa-line pb-4">
           <div>
             <div className="text-sm font-semibold text-akfa-red">AKFA VPN</div>
-            <h1 className="text-2xl font-semibold">На какое устройство хотите подключить VPN?</h1>
+            <h1 className="text-2xl font-semibold">Выберите устройство</h1>
+            {data ? <p className="mt-1 text-sm text-akfa-muted">{data.display_name}</p> : null}
           </div>
           {data ? <div className="rounded-md border border-akfa-line px-3 py-2 text-sm">Устройства: <b>{data.devices_label}</b></div> : null}
         </header>
@@ -177,7 +178,6 @@ function PublicConnectPage({ userToken }: { userToken: string }) {
             <Line k="Трафик" v={`${formatBytes(data.used_traffic)}${data.traffic_limit ? ` / ${formatBytes(data.traffic_limit)}` : ""}`} />
           </section>
         ) : null}
-        <Message tone="warning" text="Ограничение устройств работает только с клиентами, которые передают HWID. Если приложение не поддерживает HWID, подписка не будет выдана." />
         {limitReached ? <Message tone="warning" text="Лимит устройств исчерпан. Новое устройство не сможет получить конфиг." /> : null}
         <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           {options.map((option) => (
@@ -194,7 +194,7 @@ function PublicConnectPage({ userToken }: { userToken: string }) {
         <Card>
           <CardHeader>
             <h2 className="font-semibold">{current.title}: {current.client}</h2>
-            <p className="mt-1 text-sm text-akfa-muted">Не копируйте ссылку одного устройства на другое. Для нового устройства откройте эту страницу заново на нужной платформе.</p>
+            <p className="mt-1 text-sm text-akfa-muted">Откройте приложение и добавьте подписку по ссылке или QR-коду. Если подключение не добавляется, обратитесь к администратору.</p>
           </CardHeader>
           <CardContent className="grid gap-4 lg:grid-cols-[1fr_220px]">
             <div className="grid gap-3">
@@ -222,7 +222,7 @@ function PublicConnectPage({ userToken }: { userToken: string }) {
                   <Line k="Название" v={device.display_name || `DEV-${device.id}`} />
                   <Line k="Платформа" v={device.platform || "-"} />
                   <Line k="Клиент" v={device.client_name || "-"} />
-                  <Line k="HWID" v={device.hwid_masked || "-"} />
+                  <Line k="Статус" v={translateStatus(device.status)} />
                 </div>
               ))}
             </CardContent>
@@ -306,6 +306,7 @@ function LoginPage({
           {mode === "setup" ? (
             <>
               <p className="text-sm text-akfa-muted">Отсканируйте QR-код в Google Authenticator или другом приложении для одноразовых кодов.</p>
+              <p className="text-sm text-akfa-muted">2FA включится только после подтверждения кода.</p>
               {setup ? <div className="grid place-items-center"><QRCodeCanvas value={setup.otpauth_url} size={180} /></div> : null}
               {setup ? <Field label="Secret"><Input readOnly value={setup.secret} /></Field> : null}
               <Field label="Введите 6-значный код">
@@ -2316,7 +2317,7 @@ function UserDetailPage({
         <CardHeader><h2 className="font-semibold">Устройства</h2></CardHeader>
         <CardContent className="grid gap-3">
           {!devices.length ? (
-            <EmptyPanel title="Устройств пока нет" text="Первое устройство появится после запроса подписки клиентом с x-hwid." />
+            <EmptyPanel title="Устройств пока нет" text="Первое устройство появится после первого запроса подписки клиентом." />
           ) : (
             <div className="overflow-x-auto">
               <Table className="min-w-[980px]">
@@ -2766,6 +2767,8 @@ function SettingsPage() {
     try {
       const response = await api.confirmTotpSetup(null, code);
       if (response.csrf_token) api.setCsrf(response.csrf_token);
+      setSetup(null);
+      setCode("");
       setMessage("Двухфакторная защита включена");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Код не подтвержден");
@@ -2776,6 +2779,7 @@ function SettingsPage() {
     try {
       await api.disableTotp(password);
       setSetup(null);
+      setCode("");
       setMessage("Двухфакторная защита отключена");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "2FA не отключена");
@@ -2798,6 +2802,7 @@ function SettingsPage() {
         <CardContent className="grid gap-4 md:grid-cols-[1fr_220px]">
           <div className="grid gap-3">
             <p className="text-sm text-akfa-muted">Отсканируйте QR-код в Google Authenticator или другом приложении для одноразовых кодов.</p>
+            <p className="text-sm text-akfa-muted">2FA включится только после подтверждения кода. Если закрыть страницу сейчас, вход останется только по паролю.</p>
             {setup ? (
               <>
                 <Field label="Secret для ручного ввода"><Input readOnly value={setup.secret} /></Field>
@@ -3245,14 +3250,14 @@ function connectOptions(token: string) {
       title: "iPhone / iPad",
       client: "Happ",
       path: `/sub/${token}?platform=iphone&client=happ&format=raw`,
-      steps: ["Установите Happ или совместимый клиент.", "Добавьте подписку по ссылке или QR-коду.", "Разрешите VPN-профиль в iOS."]
+      steps: ["Установите Happ.", "Добавьте подписку по ссылке или QR-коду.", "Разрешите VPN-профиль в iOS."]
     },
     {
       id: "windows-fclashx",
       title: "Windows",
       client: "FClashX / Mihomo",
       path: `/sub/${token}?platform=windows&client=fclashx&format=clash`,
-      steps: ["Установите FClashX или Mihomo-compatible клиент.", "Импортируйте ссылку подписки.", "Выберите профиль akfa vpn и подключитесь."]
+      steps: ["Установите FClashX или Mihomo.", "Импортируйте ссылку подписки.", "Выберите профиль akfa vpn и подключитесь."]
     },
     {
       id: "macos-happ",
@@ -3266,7 +3271,7 @@ function connectOptions(token: string) {
       title: "macOS",
       client: "FClashX / Clash",
       path: `/sub/${token}?platform=macos&client=fclashx&format=clash`,
-      steps: ["Установите FClashX или Clash-compatible клиент.", "Импортируйте ссылку YAML-подписки.", "Выберите профиль akfa vpn."]
+      steps: ["Установите FClashX или Clash.", "Импортируйте ссылку YAML-подписки.", "Выберите профиль akfa vpn."]
     }
   ];
 }
