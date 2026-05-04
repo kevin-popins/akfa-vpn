@@ -35,6 +35,7 @@ type NodeAction = "check" | "dry-run" | "install" | "verify" | "apply-config";
 type PreviewBlock = { label: string; value: string; mono?: boolean };
 type PreviewState = { title: string; empty: string; blocks: PreviewBlock[] };
 type ConfirmState = { title: string; text: string; onConfirm: () => void; confirmLabel?: string } | null;
+type OperationState = { title: string; message: string; tone: "pending" | "success" | "warning" | "error" } | null;
 type TrafficSortKey = "user" | "online" | "upload" | "download" | "total" | "lastOnline";
 type SortDirection = "asc" | "desc";
 
@@ -828,8 +829,7 @@ function DashboardPage({
   const tiles = [
     ["Серверы", stats?.nodes_total ?? 0],
     ["Онлайн", stats?.nodes_online ?? 0],
-    ["Пользователи", stats?.users_total ?? 0],
-    ["Активные", stats?.users_active ?? 0]
+    ["Пользователи", stats?.users_total ?? 0]
   ];
   return (
     <div className="grid gap-5">
@@ -838,7 +838,7 @@ function DashboardPage({
         description="Состояние серверов, пользователей и текущей нагрузки."
         action={<Button onClick={() => setPage("add-server")}><Plus size={16} />Добавить VPS</Button>}
       />
-      <div className="grid gap-4 md:grid-cols-4">
+      <div className="grid gap-4 md:grid-cols-3">
         {tiles.map(([label, value]) => (
           <Card key={label}>
             <CardContent>
@@ -1561,8 +1561,6 @@ function DepartmentsPage({
             <div className="grid gap-3">
               {items.map((item) => {
                 const departmentUsers = visibleUsers(users).filter((user) => user.department_id === item.id);
-                const active = departmentUsers.filter((user) => user.status === "active").length;
-                const disabled = departmentUsers.filter((user) => user.status !== "active").length;
                 const traffic = departmentUsers.reduce((sum, user) => sum + (user.used_total_bytes || 0), 0);
                 return (
                   <div key={item.id} className="rounded-md border border-akfa-line p-4">
@@ -1573,10 +1571,8 @@ function DepartmentsPage({
                       </div>
                       <StatusBadge value={profileName(item.default_access_profile_id, profiles) || "Профиль не выбран"} />
                     </div>
-                    <div className="mt-3 grid gap-2 text-sm md:grid-cols-4">
+                    <div className="mt-3 grid gap-2 text-sm md:grid-cols-2">
                       <Line k="Всего пользователей" v={departmentUsers.length} />
-                      <Line k="Активных" v={active} />
-                      <Line k="Отключенных" v={disabled} />
                       <Line k="Трафик" v={formatBytes(traffic)} />
                     </div>
                     <MiniList
@@ -1839,6 +1835,7 @@ function UsersPage({
   const [departmentFilter, setDepartmentFilter] = useState("");
   const [grouped, setGrouped] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [operation, setOperation] = useState<OperationState>(null);
   const activeNodeIds = useMemo(() => nodes.filter((node) => node.status === "online").map((node) => node.id), [nodes]);
 
   useEffect(() => {
@@ -1864,16 +1861,23 @@ function UsersPage({
     setCreating(true);
     let applyTimer: number | null = null;
     try {
-      onNotice("Создаём пользователя...");
-      applyTimer = window.setTimeout(() => onNotice("Применяем конфигурацию..."), 250);
+      setOperation({ title: "Создание пользователя", message: "Создаём пользователя...", tone: "pending" });
+      applyTimer = window.setTimeout(() => setOperation({ title: "Создание пользователя", message: "Применяем конфигурацию...", tone: "pending" }), 250);
       const created = await api.createUser(payload);
       if (applyTimer) window.clearTimeout(applyTimer);
       setForm({ ...defaultUserForm, allowed_node_ids: activeNodeIds, primary_node_id: activeNodeIds[0] ? String(activeNodeIds[0]) : "" });
-      await onCreated(created);
-      onNotice(formatApplyStatusMessage("Пользователь успешно добавлен", created.apply_status, "Пользователь создан, но конфигурация не применена"));
+      const message = formatApplyStatusMessage("Пользователь успешно добавлен", created.apply_status, "Пользователь создан, но конфигурация не применена");
+      const tone = applyStatusHasProblems(created.apply_status) ? "warning" : "success";
+      try {
+        await onCreated(created);
+        setOperation({ title: "Создание пользователя", message, tone });
+      } catch (refreshError) {
+        const refreshMessage = refreshError instanceof Error ? refreshError.message : "список не обновился";
+        setOperation({ title: "Пользователь создан", message: `${message}. Обновите список вручную: ${refreshMessage}`, tone: "warning" });
+      }
     } catch (error) {
       if (applyTimer) window.clearTimeout(applyTimer);
-      onNotice(error instanceof Error ? error.message : "Пользователь не создан");
+      setOperation({ title: "Ошибка создания", message: `Ошибка: ${error instanceof Error ? error.message : "Пользователь не создан"}`, tone: "error" });
     } finally {
       setCreating(false);
     }
@@ -2000,6 +2004,7 @@ function UsersPage({
           </Button>
         </CardContent>
       </Card>
+      <OperationPopup state={operation} onClose={() => setOperation(null)} />
     </div>
   );
 }
@@ -2157,6 +2162,7 @@ function UserDetailPage({
   const [nodeSelection, setNodeSelection] = useState<{ ids: number[]; primaryId: number | null }>({ ids: [], primaryId: null });
   const [editForm, setEditForm] = useState(defaultUserForm);
   const [savingUser, setSavingUser] = useState(false);
+  const [operation, setOperation] = useState<OperationState>(null);
   const [activeTab, setActiveTab] = useState("Ссылка подписки");
   const [confirm, setConfirm] = useState<ConfirmState>(null);
 
@@ -2286,17 +2292,24 @@ function UserDetailPage({
     setSavingUser(true);
     let applyTimer: number | null = null;
     try {
-      onNotice("Сохраняем изменения...");
-      applyTimer = window.setTimeout(() => onNotice("Применяем конфигурацию..."), 250);
+      setOperation({ title: "Обновление пользователя", message: "Сохраняем изменения...", tone: "pending" });
+      applyTimer = window.setTimeout(() => setOperation({ title: "Обновление пользователя", message: "Применяем конфигурацию...", tone: "pending" }), 250);
       const updated = await api.updateUser(user.id, userPayload({ ...editForm, allowed_node_ids: nodeSelection.ids, primary_node_id: nodeSelection.primaryId ? String(nodeSelection.primaryId) : "" }));
       if (applyTimer) window.clearTimeout(applyTimer);
       setEditForm(userFormFromUser(updated));
       setNodeSelection({ ids: updated.allowed_node_ids || [], primaryId: updated.primary_node_id || null });
-      await onUpdated(updated);
-      onNotice(formatApplyStatusMessage("Пользователь обновлён", updated.apply_status, "Пользователь обновлён, но конфигурация не применена"));
+      const message = formatApplyStatusMessage("Пользователь обновлён", updated.apply_status, "Пользователь обновлён, но конфигурация не применена");
+      const tone = applyStatusHasProblems(updated.apply_status) ? "warning" : "success";
+      try {
+        await onUpdated(updated);
+        setOperation({ title: "Обновление пользователя", message, tone });
+      } catch (refreshError) {
+        const refreshMessage = refreshError instanceof Error ? refreshError.message : "данные не обновились";
+        setOperation({ title: "Пользователь обновлён", message: `${message}. Обновите список вручную: ${refreshMessage}`, tone: "warning" });
+      }
     } catch (error) {
       if (applyTimer) window.clearTimeout(applyTimer);
-      onNotice(error instanceof Error ? error.message : "Изменения не сохранены");
+      setOperation({ title: "Ошибка обновления", message: `Ошибка: ${error instanceof Error ? error.message : "Изменения не сохранены"}`, tone: "error" });
     } finally {
       setSavingUser(false);
     }
@@ -2518,6 +2531,7 @@ function UserDetailPage({
       </Card>
     </div>
     <ConfirmDialog open={Boolean(confirm)} title={confirm?.title || ""} text={confirm?.text || ""} confirmLabel={confirm?.confirmLabel} onCancel={() => setConfirm(null)} onConfirm={() => confirm?.onConfirm()} />
+    <OperationPopup state={operation} onClose={() => setOperation(null)} />
     </>
   );
 }
@@ -2909,10 +2923,15 @@ function AuditPage({ rows, onRefresh }: { rows: Array<Record<string, unknown>>; 
 }
 
 function SettingsPage() {
+  const [admin, setAdmin] = useState<{ email: string; role: string; totp_enabled: boolean } | null>(null);
   const [setup, setSetup] = useState<{ secret: string; otpauth_url: string } | null>(null);
   const [code, setCode] = useState("");
   const [password, setPassword] = useState("");
   const [message, setMessage] = useState("");
+
+  useEffect(() => {
+    api.me().then(setAdmin).catch((error) => setMessage(error instanceof Error ? error.message : "Настройки недоступны"));
+  }, []);
 
   async function startSetup() {
     try {
@@ -2927,6 +2946,8 @@ function SettingsPage() {
     try {
       const response = await api.confirmTotpSetup(null, code);
       if (response.csrf_token) api.setCsrf(response.csrf_token);
+      if (response.admin) setAdmin(response.admin);
+      else setAdmin(await api.me());
       setSetup(null);
       setCode("");
       setMessage("Двухфакторная защита включена");
@@ -2937,9 +2958,11 @@ function SettingsPage() {
 
   async function disable() {
     try {
-      await api.disableTotp(password);
+      const next = await api.disableTotp(password);
+      setAdmin(next);
       setSetup(null);
       setCode("");
+      setPassword("");
       setMessage("Двухфакторная защита отключена");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "2FA не отключена");
@@ -2953,7 +2976,7 @@ function SettingsPage() {
       <Card>
         <CardContent className="grid gap-3 md:grid-cols-3">
           <StatusBadge value="secure_cookies" />
-          <StatusBadge value="totp_2fa" />
+          <StatusBadge value={admin?.totp_enabled ? "2FA включена" : "2FA выключена"} />
           <StatusBadge value="csrf" />
         </CardContent>
       </Card>
@@ -2961,21 +2984,30 @@ function SettingsPage() {
         <CardHeader><h2 className="font-semibold">Двухфакторная защита</h2></CardHeader>
         <CardContent className="grid gap-4 md:grid-cols-[1fr_220px]">
           <div className="grid gap-3">
-            <p className="text-sm text-akfa-muted">Отсканируйте QR-код в Google Authenticator или другом приложении для одноразовых кодов.</p>
-            <p className="text-sm text-akfa-muted">2FA включится только после подтверждения кода. Если закрыть страницу сейчас, вход останется только по паролю.</p>
+            {admin?.totp_enabled && !setup ? <Message tone="success" text="2FA включена" /> : null}
+            {!admin?.totp_enabled || setup ? (
+              <>
+                <p className="text-sm text-akfa-muted">Отсканируйте QR-код в Google Authenticator или другом приложении для одноразовых кодов.</p>
+                <p className="text-sm text-akfa-muted">2FA включится только после подтверждения кода. Если закрыть страницу сейчас, вход останется только по паролю.</p>
+              </>
+            ) : null}
             {setup ? (
               <>
                 <Field label="Secret для ручного ввода"><Input readOnly value={setup.secret} /></Field>
                 <Field label="Введите 6-значный код"><Input value={code} onChange={(event) => setCode(event.target.value)} inputMode="numeric" /></Field>
                 <Button onClick={confirmSetup}><CheckCircle2 size={16} />Подтвердить</Button>
               </>
-            ) : (
+            ) : admin && !admin.totp_enabled ? (
               <Button onClick={startSetup}><ShieldCheck size={16} />Включить 2FA</Button>
+            ) : null}
+            {admin?.totp_enabled ? (
+              <div className="grid gap-2 border-t border-akfa-line pt-3">
+                <Field label="Пароль для отключения"><Input value={password} onChange={(event) => setPassword(event.target.value)} type="password" /></Field>
+                <Button variant="secondary" onClick={disable}>Сбросить 2FA</Button>
+              </div>
+            ) : (
+              null
             )}
-            <div className="grid gap-2 border-t border-akfa-line pt-3">
-              <Field label="Пароль для отключения"><Input value={password} onChange={(event) => setPassword(event.target.value)} type="password" /></Field>
-              <Button variant="secondary" onClick={disable}>Сбросить 2FA</Button>
-            </div>
           </div>
           {setup ? <div className="grid place-items-center rounded-md border border-akfa-line p-4"><QRCodeCanvas value={setup.otpauth_url} size={180} /></div> : null}
         </CardContent>
@@ -3067,6 +3099,36 @@ function Message({ tone, text }: { tone: "success" | "error" | "warning"; text: 
     <div className={`flex items-start gap-2 rounded-md border px-3 py-2 text-sm ${classes[tone]}`}>
       <Icon className="mt-0.5 shrink-0" size={16} />
       <span>{text}</span>
+    </div>
+  );
+}
+
+function OperationPopup({ state, onClose }: { state: OperationState; onClose: () => void }) {
+  useEffect(() => {
+    if (!state || state.tone === "pending" || state.tone === "error") return;
+    const timer = window.setTimeout(onClose, 3000);
+    return () => window.clearTimeout(timer);
+  }, [state, onClose]);
+
+  if (!state) return null;
+  const Icon = state.tone === "success" ? CheckCircle2 : state.tone === "warning" || state.tone === "error" ? AlertTriangle : null;
+  const toneClass = state.tone === "success" ? "text-akfa-green" : state.tone === "warning" ? "text-amber-700" : state.tone === "error" ? "text-akfa-red" : "text-akfa-red";
+  return (
+    <div className="fixed inset-x-0 top-8 z-[60] flex justify-center px-4">
+      <div className="w-full max-w-md rounded-md border border-akfa-line bg-white p-4 shadow-panel">
+        <div className="flex items-start gap-3">
+          {state.tone === "pending" ? (
+            <span className="mt-0.5 h-5 w-5 shrink-0 animate-spin rounded-full border-2 border-akfa-line border-t-akfa-red" />
+          ) : Icon ? (
+            <Icon className={`mt-0.5 shrink-0 ${toneClass}`} size={18} />
+          ) : null}
+          <div className="min-w-0 flex-1">
+            <div className="font-semibold">{state.title}</div>
+            <div className="mt-1 text-sm text-akfa-muted">{state.message}</div>
+          </div>
+          {state.tone !== "pending" ? <button className="text-akfa-muted" onClick={onClose}>×</button> : null}
+        </div>
+      </div>
     </div>
   );
 }
@@ -3292,6 +3354,10 @@ function formatApplyStatusMessage(base: string, applyStatus?: ConfigApplySummary
   return `${partialBase || `${base}, но конфиг не применился`}${details ? `: ${details}` : ""}`;
 }
 
+function applyStatusHasProblems(applyStatus?: ConfigApplySummary | null) {
+  return Boolean(applyStatus?.results.some((item) => !item.ok || item.status === "skipped"));
+}
+
 function downloadText(filename: string, value: string) {
   const blob = new Blob([value], { type: "application/json;charset=utf-8" });
   const link = document.createElement("a");
@@ -3450,13 +3516,6 @@ function connectOptions(token: string) {
       client: "FClashX / Mihomo",
       path: `/sub/${token}?platform=windows&client=fclashx&format=clash`,
       steps: ["Установите FClashX или Mihomo.", "Импортируйте ссылку подписки.", "Выберите профиль akfa vpn и подключитесь."]
-    },
-    {
-      id: "macos-happ",
-      title: "macOS",
-      client: "Happ",
-      path: `/sub/${token}?platform=macos&client=happ&format=raw`,
-      steps: ["Установите Happ.", "Добавьте подписку по ссылке.", "Обновите список серверов и подключитесь."]
     },
     {
       id: "macos-fclashx",

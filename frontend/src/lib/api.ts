@@ -308,7 +308,7 @@ export const api = {
     localStorage.setItem("akfa_csrf", token);
   },
   login(email: string, password: string) {
-    return request<{ requires_2fa: boolean; setup_required?: boolean; login_token?: string; csrf_token?: string }>("/auth/login", {
+    return request<{ requires_2fa: boolean; setup_required?: boolean; login_token?: string; csrf_token?: string; admin?: { email: string; role: string; totp_enabled: boolean } | null }>("/auth/login", {
       method: "POST",
       body: JSON.stringify({ email, password })
     });
@@ -320,13 +320,13 @@ export const api = {
     return request<{ csrf_token?: string }>("/auth/2fa/verify", { method: "POST", body: JSON.stringify({ login_token: loginToken, code }) });
   },
   me() {
-    return request<{ email: string; role: string }>("/auth/me");
+    return request<{ email: string; role: string; totp_enabled: boolean }>("/auth/me");
   },
   startTotpSetup(loginToken?: string) {
     return request<{ secret: string; otpauth_url: string }>("/auth/2fa/setup/start", { method: "POST", body: JSON.stringify({ login_token: loginToken || null }) });
   },
   confirmTotpSetup(loginToken: string | null, code: string) {
-    return request<{ csrf_token?: string }>("/auth/2fa/setup/confirm", { method: "POST", body: JSON.stringify({ login_token: loginToken, code }) });
+    return request<{ csrf_token?: string; admin?: { email: string; role: string; totp_enabled: boolean } | null }>("/auth/2fa/setup/confirm", { method: "POST", body: JSON.stringify({ login_token: loginToken, code }) });
   },
   disableTotp(password: string) {
     return request<{ email: string; role: string; totp_enabled: boolean }>("/auth/2fa/disable", { method: "POST", body: JSON.stringify({ password }) });

@@ -515,6 +515,7 @@ def list_users(_: Admin = Depends(current_admin), db: Session = Depends(get_db))
 
 @router.post("/users", response_model=VpnUserRead)
 async def create_user(payload: VpnUserCreate, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> VpnUser:
+    logger.info("create user start admin_id=%s username=%s", admin.id, payload.username)
     expires_at = payload.expires_at
     profile = db.get(AccessProfile, payload.access_profile_id) if payload.access_profile_id else None
     if not expires_at and profile and profile.expires_in_days:
@@ -538,6 +539,24 @@ async def create_user(payload: VpnUserCreate, admin: Admin = Depends(require_wri
     audit(db, "create", "vpn_user", user.id, admin.id)
     summary = await safe_auto_apply_after_change(db, admin, new_ids, "auto_apply_after_user_create")
     db.commit()
+    if summary.ok:
+        logger.info(
+            "create user response success admin_id=%s user_id=%s username=%s apply_attempted=%s apply_skipped=%s",
+            admin.id,
+            user.id,
+            user.username,
+            summary.attempted,
+            summary.skipped,
+        )
+    else:
+        logger.warning(
+            "create user response partial_success admin_id=%s user_id=%s username=%s apply_failed=%s apply_skipped=%s",
+            admin.id,
+            user.id,
+            user.username,
+            summary.failed,
+            summary.skipped,
+        )
     return attach_apply_status(user, summary)
 
 

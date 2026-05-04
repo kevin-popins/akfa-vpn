@@ -375,6 +375,37 @@ def test_user_create_persists_and_reports_apply_failure(client, auth_headers, db
     assert db_session.query(VpnUser).filter_by(username="bad.sync").first() is not None
 
 
+def test_user_create_with_apply_warning_returns_structured_success_not_false_500(client, auth_headers, db_session, monkeypatch):
+    node_payload = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "Warning apply", "ip_address": "203.0.113.35", "ssh_username": "root", "ssh_password": "secret"},
+    ).json()
+    from app.models import VpsNode, VpnUser
+
+    node = db_session.get(VpsNode, node_payload["id"])
+    node.status = "online"
+    node.install_log = [{"message": "Начата реальная установка Xray"}]
+    db_session.commit()
+
+    async def fake_apply(self):
+        return InstallResult(ok=False, logs=[{"level": "error", "message": "controlled warning"}])
+
+    monkeypatch.setattr(XrayInstaller, "apply_config", fake_apply)
+    response = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={"first_name": "Apply", "last_name": "Warning", "username": "apply.warning"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["username"] == "apply.warning"
+    assert body["apply_status"]["ok"] is False
+    assert body["apply_status"]["failed"] == 1
+    assert "controlled warning" in body["apply_status"]["results"][0]["error"]
+    assert db_session.query(VpnUser).filter_by(username="apply.warning").first() is not None
+
+
 def test_user_create_reports_unhandled_apply_exception_as_warning(client, auth_headers, db_session, monkeypatch):
     node_payload = client.post(
         "/admin/nodes",

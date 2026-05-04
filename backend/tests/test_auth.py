@@ -29,6 +29,9 @@ def test_totp_setup_start_does_not_enable_or_require_2fa(client, db_session):
     assert login.status_code == 200
     start = client.post("/auth/2fa/setup/start", json={})
     assert start.status_code == 200
+    me_before_confirm = client.get("/auth/me")
+    assert me_before_confirm.status_code == 200
+    assert me_before_confirm.json()["totp_enabled"] is False
     admin = db_session.query(Admin).filter_by(email="admin@example.com").one()
     assert admin.pending_totp_secret == start.json()["secret"]
     assert admin.totp_secret is None
@@ -49,6 +52,10 @@ def test_totp_confirm_valid_code_enables_and_next_login_requires_2fa(client, db_
 
     confirm = client.post("/auth/2fa/setup/confirm", json={"code": code})
     assert confirm.status_code == 200
+    assert confirm.json()["admin"]["totp_enabled"] is True
+    me_after_confirm = client.get("/auth/me")
+    assert me_after_confirm.status_code == 200
+    assert me_after_confirm.json()["totp_enabled"] is True
     admin = db_session.query(Admin).filter_by(email="admin@example.com").one()
     assert admin.totp_secret == secret
     assert admin.pending_totp_secret is None
