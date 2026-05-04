@@ -5,6 +5,7 @@ from urllib.parse import parse_qs, urlparse
 
 from app.models import VpnUserDevice, VpsNode
 from app.services.ssh_installer import InstallResult, XrayInstaller
+from app.services.config_apply import ConfigApplyService
 from app.services.xray_config import render_server_config
 
 
@@ -181,6 +182,9 @@ def test_device_revoke_and_reset_auto_apply_remove_hwid_clients(client, auth_hea
     assert old_device_uuid not in fake_xray_apply[-1]["config"]
     assert client.get(f"/sub/device/{old_device_token}", headers={"x-hwid": "revoke-phone"}).status_code == 404
     assert db_session.query(VpnUserDevice).filter_by(vpn_user_id=user["id"]).count() == 0
+    repeated = client.post(f"/admin/users/{user['id']}/devices/{device.id}/revoke", headers=auth_headers)
+    assert repeated.status_code == 200
+    assert repeated.json()["message"] == "Устройство уже удалено"
 
     recreated = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "revoke-phone"})
     assert recreated.status_code == 200
@@ -217,12 +221,72 @@ def test_public_connect_can_remove_device_and_same_hwid_registers_again(client, 
     assert removed.status_code == 200
     assert db_session.query(VpnUserDevice).filter_by(vpn_user_id=user["id"]).count() == 0
     assert old_uuid not in fake_xray_apply[-1]["config"]
+    second_remove = client.delete(f"/public/connect/{user['subscription_token']}/devices/{device.id}")
+    assert second_remove.status_code == 200
+    assert second_remove.json()["message"] == "Устройство уже удалено"
 
     recreated = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "public-phone"})
     assert recreated.status_code == 200
     new_device = db_session.query(VpnUserDevice).filter_by(vpn_user_id=user["id"]).one()
     assert new_device.uuid != old_uuid
     assert new_device.uuid in recreated.text
+
+    apply_count = len(fake_xray_apply)
+    poll = client.get(f"/public/connect/{user['subscription_token']}")
+    assert poll.status_code == 200
+    assert len(fake_xray_apply) == apply_count
+
+
+def test_device_remove_apply_failure_rolls_back_active_device(client, auth_headers, db_session, monkeypatch):
+    node_payload = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "Remove fail", "ip_address": "203.0.113.95", "ssh_username": "root", "ssh_password": "secret"},
+    ).json()
+    node = db_session.get(VpsNode, node_payload["id"])
+    node.status = "online"
+    db_session.commit()
+    user = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={"first_name": "Remove", "last_name": "Fail", "username": "remove-fail"},
+    ).json()
+    created = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "remove-fail-phone"})
+    assert created.status_code == 200
+    device = db_session.query(VpnUserDevice).filter_by(vpn_user_id=user["id"]).one()
+
+    async def failed_apply(self):
+        return InstallResult(ok=False, logs=[{"level": "error", "message": "failed"}])
+
+    monkeypatch.setattr(XrayInstaller, "apply_config", failed_apply)
+    removed = client.post(f"/admin/users/{user['id']}/devices/{device.id}/revoke", headers=auth_headers)
+    assert removed.status_code == 503
+    db_session.expire_all()
+    assert db_session.query(VpnUserDevice).filter_by(id=device.id, status="active").one()
+
+
+@pytest.mark.asyncio
+async def test_apply_config_timeout_is_controlled(client, auth_headers, db_session, monkeypatch):
+    node_payload = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "Timeout apply", "ip_address": "203.0.113.96", "ssh_username": "root", "ssh_password": "secret"},
+    ).json()
+    node = db_session.get(VpsNode, node_payload["id"])
+    node.status = "online"
+    node.xray_installed = True
+    db_session.commit()
+
+    async def slow_apply(self):
+        import asyncio
+
+        await asyncio.sleep(0.05)
+        return InstallResult(ok=True, logs=[{"message": "late"}])
+
+    monkeypatch.setattr(XrayInstaller, "apply_config", slow_apply)
+    summary = await ConfigApplyService(db_session).apply_to_nodes({node.id}, timeout_seconds=0.01)
+    assert summary.failed == 1
+    assert "Таймаут" in (summary.results[0].error or "")
 
 
 def test_device_subscription_requires_matching_hwid_and_clash_is_yaml(client, auth_headers, db_session):

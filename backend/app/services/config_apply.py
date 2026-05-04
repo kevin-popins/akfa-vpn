@@ -1,4 +1,7 @@
+import asyncio
 import hashlib
+import logging
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 
@@ -17,6 +20,8 @@ APPLY_SUCCESS = "success"
 APPLY_FAILED = "failed"
 APPLY_SKIPPED = "skipped"
 APPLY_PENDING = "pending"
+APPLY_FLOW_TIMEOUT_SECONDS = 25
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -84,13 +89,35 @@ class ConfigApplyService:
         reason: str = "auto_apply_xray_config",
         include_uninstalled: bool = False,
         allow_non_online: bool = False,
+        timeout_seconds: int = APPLY_FLOW_TIMEOUT_SECONDS,
     ) -> ConfigApplySummary:
         self.db.flush()
         nodes = self._target_nodes(set(node_ids) if node_ids is not None else None, include_uninstalled)
         users = self._fresh_users()
         results: list[NodeApplyResult] = []
+        deadline = time.monotonic() + timeout_seconds
         for node in nodes:
-            results.append(await self._apply_node(node, users, reason, allow_non_online))
+            remaining = max(0.1, deadline - time.monotonic())
+            if remaining <= 0.1:
+                results.append(self._mark_failed(node, "Таймаут применения конфигурации Xray", datetime.now(timezone.utc), None))
+                logger.error("apply-config timeout before node node_id=%s reason=%s", node.id, reason)
+                continue
+            logger.info("apply-config start node_id=%s reason=%s timeout_left=%.1f", node.id, reason, remaining)
+            try:
+                result = await asyncio.wait_for(
+                    self._apply_node(node, users, reason, allow_non_online),
+                    timeout=remaining,
+                )
+            except TimeoutError:
+                result = self._mark_failed(node, "Таймаут применения конфигурации Xray", datetime.now(timezone.utc), None)
+                logger.exception("apply-config timeout node_id=%s reason=%s", node.id, reason)
+            if result.status == APPLY_SUCCESS:
+                logger.info("apply-config success node_id=%s reason=%s config_version=%s", node.id, reason, result.config_version)
+            elif result.status == APPLY_FAILED:
+                logger.error("apply-config failed node_id=%s reason=%s error=%s", node.id, reason, result.error)
+            else:
+                logger.info("apply-config skipped node_id=%s reason=%s error=%s", node.id, reason, result.error)
+            results.append(result)
         attempted = sum(1 for result in results if result.status != APPLY_SKIPPED)
         succeeded = sum(1 for result in results if result.status == APPLY_SUCCESS)
         failed = sum(1 for result in results if result.status == APPLY_FAILED)

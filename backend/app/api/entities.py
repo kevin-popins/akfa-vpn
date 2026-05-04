@@ -9,6 +9,7 @@ from typing import Any, TypeVar
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, UploadFile, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import current_admin, require_write
@@ -625,24 +626,33 @@ async def update_user_device(
 @router.post("/users/{user_id}/devices/{device_id}/revoke", response_model=Message)
 async def revoke_user_device(user_id: int, device_id: int, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> Message:
     user = _get_or_404(db, VpnUser, user_id)
-    device = _get_or_404(db, VpnUserDevice, device_id)
-    if device.vpn_user_id != user.id:
-        raise HTTPException(status_code=404, detail="Устройство не найдено")
+    device = db.get(VpnUserDevice, device_id)
+    if not device or device.vpn_user_id != user.id:
+        logger.info("remove device already_removed admin_id=%s user_id=%s device_id=%s", admin.id, user.id, device_id)
+        return Message(message="Устройство уже удалено")
     device_id_for_audit = device.id
+    logger.info("remove device start admin_id=%s user_id=%s device_id=%s", admin.id, user.id, device.id)
     try:
         summary = await _remove_device_and_apply(db, user, device, reason="auto_apply_after_device_remove", admin_id=admin.id)
     except ConfigApplyRequiredError as exc:
         db.rollback()
-        raise HTTPException(status_code=502, detail=str(exc) or "Конфиг Xray не удалось применить") from exc
+        logger.exception("remove device failed admin_id=%s user_id=%s device_id=%s", admin.id, user.id, device_id_for_audit)
+        raise HTTPException(status_code=503, detail=str(exc) or "Конфиг Xray не удалось применить") from exc
     audit(db, "remove_device", "vpn_user_device", device_id_for_audit, admin.id)
     db.commit()
+    logger.info("remove device success admin_id=%s user_id=%s device_id=%s", admin.id, user.id, device_id_for_audit)
     return Message(message="Устройство удалено", apply_status=summary.as_dict() if summary else None)
 
 
 @router.post("/users/{user_id}/devices/reset", response_model=list[VpnUserDeviceRead])
 async def reset_user_devices(user_id: int, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> list[VpnUserDevice]:
     user = _get_or_404(db, VpnUser, user_id)
-    for device in list(user.devices):
+    logger.info("reset devices start admin_id=%s user_id=%s", admin.id, user.id)
+    devices_to_delete = list(user.devices)
+    if not devices_to_delete:
+        logger.info("reset devices already_empty admin_id=%s user_id=%s", admin.id, user.id)
+        return []
+    for device in devices_to_delete:
         db.delete(device)
     db.flush()
     audit(db, "reset_devices", "vpn_user", user.id, admin.id)
@@ -657,8 +667,10 @@ async def reset_user_devices(user_id: int, admin: Admin = Depends(require_write)
             )
         except ConfigApplyRequiredError as exc:
             db.rollback()
-            raise HTTPException(status_code=502, detail=str(exc) or "Конфиг Xray не удалось применить") from exc
+            logger.exception("reset devices failed admin_id=%s user_id=%s", admin.id, user.id)
+            raise HTTPException(status_code=503, detail=str(exc) or "Конфиг Xray не удалось применить") from exc
     db.commit()
+    logger.info("reset devices success admin_id=%s user_id=%s", admin.id, user.id)
     return []
 
 
@@ -850,17 +862,21 @@ async def _remove_device_and_apply(
     reason: str,
     admin_id: int | None = None,
 ) -> ConfigApplySummary | None:
+    logger.info("device remove apply start user_id=%s device_id=%s reason=%s", user.id, device.id, reason)
     db.delete(device)
     db.flush()
     if not affected_node_ids_for_user(user):
+        logger.info("device remove apply skipped no_nodes user_id=%s reason=%s", user.id, reason)
         return None
-    return await apply_config_for_user(
+    summary = await apply_config_for_user(
         db,
         user,
         reason=reason,
         admin_id=admin_id,
         require_success=True,
     )
+    logger.info("device remove apply success user_id=%s reason=%s summary=%s", user.id, reason, summary.as_dict())
+    return summary
 
 
 async def _apply_for_subscription(db: Session, user: VpnUser) -> ConfigApplySummary:
@@ -903,13 +919,17 @@ async def public_disconnect_device(user_token: str, device_id: int, db: Session 
     user = validate_subscription_user(db.scalar(select(VpnUser).where(VpnUser.subscription_token == user_token)))
     device = db.get(VpnUserDevice, device_id)
     if not device or device.vpn_user_id != user.id:
-        raise HTTPException(status_code=404, detail="Устройство не найдено")
+        logger.info("public remove device already_removed user_id=%s device_id=%s", user.id, device_id)
+        return Message(message="Устройство уже удалено")
+    logger.info("public remove device start user_id=%s device_id=%s", user.id, device.id)
     try:
         summary = await _remove_device_and_apply(db, user, device, reason="auto_apply_after_public_device_remove")
     except ConfigApplyRequiredError as exc:
         db.rollback()
+        logger.exception("public remove device failed user_id=%s device_id=%s", user.id, device_id)
         raise HTTPException(status_code=503, detail="Не удалось применить конфигурацию на сервер") from exc
     db.commit()
+    logger.info("public remove device success user_id=%s device_id=%s", user.id, device_id)
     return Message(message="Устройство удалено", apply_status=summary.as_dict() if summary else None)
 
 
@@ -977,6 +997,7 @@ async def subscription(
     if not affected_node_ids:
         return _plain_forbidden("Пользователю не назначен сервер")
 
+    user_id_for_log = user.id
     device = VpnUserDevice(
         vpn_user_id=user.id,
         uuid=str(uuid.uuid4()),
@@ -984,8 +1005,27 @@ async def subscription(
         status=DeviceStatus.active.value,
     )
     db.add(device)
-    db.flush()
     apply_device_metadata(device, context, created=True)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        logger.info("subscription new hwid race detected user_id=%s", user_id_for_log)
+        user = validate_subscription_user(db.scalar(select(VpnUser).where(VpnUser.subscription_token == token)))
+        existing = db.scalar(
+            select(VpnUserDevice).where(
+                VpnUserDevice.vpn_user_id == user.id,
+                VpnUserDevice.hwid_hash == context.hwid_hash,
+                VpnUserDevice.status == DeviceStatus.active.value,
+            )
+        )
+        if not existing:
+            return _plain_error("Не удалось зарегистрировать устройство", status.HTTP_503_SERVICE_UNAVAILABLE)
+        response = subscription_response(db, user, existing, format)
+        response.headers["x-hwid-limit"] = "true"
+        response.headers["x-hwid-active"] = "true"
+        return response
+    logger.info("subscription new hwid device created pending_apply user_id=%s device_id=%s", user.id, device.id)
     if not device.display_name or device.display_name == "Новое устройство":
         device.display_name = build_display_name(
             device_model=device.device_model,
@@ -999,10 +1039,12 @@ async def subscription(
     except ConfigApplyRequiredError as exc:
         summary = exc.summary.as_dict() if exc.summary else None
         user_id = user.id
+        device_id = device.id
         db.rollback()
         logger.error(
-            "Subscription config apply failed for vpn_user_id=%s nodes=%s summary=%s",
+            "subscription new hwid apply failed user_id=%s device_id=%s nodes=%s summary=%s",
             user_id,
+            device_id,
             sorted(affected_node_ids),
             summary,
         )
@@ -1010,6 +1052,7 @@ async def subscription(
             return _plain_forbidden("Пользователю не назначен сервер")
         return _plain_error("Не удалось применить конфигурацию на сервер", status.HTTP_503_SERVICE_UNAVAILABLE)
     db.commit()
+    logger.info("subscription new hwid apply success user_id=%s device_id=%s", user.id, device.id)
     response = subscription_response(db, user, device, format)
     response.headers["x-hwid-limit"] = "true"
     response.headers["x-hwid-active"] = "true"

@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
+import asyncio
 
 import asyncssh
 
@@ -20,6 +21,9 @@ READ_ONLY_CHECK_COMMANDS = [
     "command -v curl || true",
     "command -v jq || true",
 ]
+
+SSH_CONNECT_TIMEOUT_SECONDS = 10
+SSH_COMMAND_TIMEOUT_SECONDS = 20
 
 
 @dataclass
@@ -245,13 +249,16 @@ class XrayInstaller:
     async def _connect(self) -> asyncssh.SSHClientConnection:
         password = decrypt_secret(self.node.encrypted_ssh_password)
         private_key = decrypt_secret(self.node.encrypted_private_key)
-        return await asyncssh.connect(
-            self.node.ip_address,
-            port=self.node.ssh_port,
-            username=self.node.ssh_username,
-            password=password,
-            client_keys=[asyncssh.import_private_key(private_key)] if private_key else None,
-            known_hosts=None,
+        return await asyncio.wait_for(
+            asyncssh.connect(
+                self.node.ip_address,
+                port=self.node.ssh_port,
+                username=self.node.ssh_username,
+                password=password,
+                client_keys=[asyncssh.import_private_key(private_key)] if private_key else None,
+                known_hosts=None,
+            ),
+            timeout=SSH_CONNECT_TIMEOUT_SECONDS,
         )
 
     async def _exec(
@@ -266,7 +273,14 @@ class XrayInstaller:
     ):
         displayed = log_command or command
         self._log("info", displayed, "Выполняется команда", mutating=mutating)
-        result = await conn.run(command, input=input_data, check=False)
+        try:
+            result = await asyncio.wait_for(
+                conn.run(command, input=input_data, check=False),
+                timeout=SSH_COMMAND_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as exc:
+            self._log("error", displayed, "Таймаут выполнения SSH-команды", stderr=f"{SSH_COMMAND_TIMEOUT_SECONDS}s", mutating=mutating)
+            raise RuntimeError(f"Таймаут выполнения команды: {displayed}") from exc
         self._log(
             "info" if result.exit_status == 0 else "error",
             displayed,

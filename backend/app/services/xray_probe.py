@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import datetime, timezone
 from typing import Any
@@ -7,6 +8,7 @@ import asyncssh
 from app.core.security import decrypt_secret, mask_secret
 from app.models import NodeManagedMode, NodeStatus, VpsNode
 from app.schemas.entities import XrayProbeResponse
+from app.services.ssh_installer import SSH_COMMAND_TIMEOUT_SECONDS, SSH_CONNECT_TIMEOUT_SECONDS
 
 
 READ_ONLY_PROBE_COMMANDS = [
@@ -24,7 +26,10 @@ async def probe_xray(node: VpsNode) -> XrayProbeResponse:
 
     async def run(conn: asyncssh.SSHClientConnection, command: str, allow_failure: bool = True):
         logs.append({"command": command, "mutating": False, "message": "read-only probe"})
-        result = await conn.run(command, check=False)
+        result = await asyncio.wait_for(
+            conn.run(command, check=False),
+            timeout=SSH_COMMAND_TIMEOUT_SECONDS,
+        )
         logs.append(
             {
                 "command": command,
@@ -139,11 +144,14 @@ def import_probe_to_node(node: VpsNode, probe: XrayProbeResponse, public_key: st
 async def _connect(node: VpsNode) -> asyncssh.SSHClientConnection:
     password = decrypt_secret(node.encrypted_ssh_password)
     private_key = decrypt_secret(node.encrypted_private_key)
-    return await asyncssh.connect(
-        node.ip_address,
-        port=node.ssh_port,
-        username=node.ssh_username,
-        password=password,
-        client_keys=[asyncssh.import_private_key(private_key)] if private_key else None,
-        known_hosts=None,
+    return await asyncio.wait_for(
+        asyncssh.connect(
+            node.ip_address,
+            port=node.ssh_port,
+            username=node.ssh_username,
+            password=password,
+            client_keys=[asyncssh.import_private_key(private_key)] if private_key else None,
+            known_hosts=None,
+        ),
+        timeout=SSH_CONNECT_TIMEOUT_SECONDS,
     )

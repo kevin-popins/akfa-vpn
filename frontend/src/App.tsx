@@ -142,16 +142,28 @@ function PublicConnectPage({ userToken }: { userToken: string }) {
   const [selected, setSelected] = useState("android-happ");
   const [notice, setNotice] = useState("");
   const [loading, setLoading] = useState(true);
+  const [pollMs, setPollMs] = useState(7000);
+  const [removingIds, setRemovingIds] = useState<Set<number>>(new Set());
+  const refreshingRef = useRef(false);
+  const mutatingRef = useRef(false);
+  const refreshSeqRef = useRef(0);
 
-  const refresh = useCallback(async (silent = false) => {
+  const refresh = useCallback(async (silent = false, force = false) => {
+    if (refreshingRef.current && !force) return;
+    if (silent && mutatingRef.current) return;
+    refreshingRef.current = true;
+    const seq = ++refreshSeqRef.current;
     try {
       const next = await api.publicConnect(userToken);
-      setData(next);
+      if (seq === refreshSeqRef.current) setData(next);
+      setPollMs(7000);
       if (!silent) setNotice("");
     } catch (error) {
-      setData(null);
-      setNotice(error instanceof Error ? error.message : "Подключение недоступно");
+      if (seq === refreshSeqRef.current) setData(null);
+      setPollMs(15000);
+      if (!silent) setNotice(error instanceof Error ? error.message : "Подключение недоступно");
     } finally {
+      refreshingRef.current = false;
       setLoading(false);
     }
   }, [userToken]);
@@ -160,9 +172,9 @@ function PublicConnectPage({ userToken }: { userToken: string }) {
     void refresh();
     const timer = window.setInterval(() => {
       void refresh(true);
-    }, 7000);
+    }, pollMs);
     return () => window.clearInterval(timer);
-  }, [refresh]);
+  }, [pollMs, refresh]);
 
   const options = connectOptions(userToken);
   const current = options.find((item) => item.id === selected) || options[0];
@@ -177,12 +189,29 @@ function PublicConnectPage({ userToken }: { userToken: string }) {
   async function removeDevice(device: VpnUserDevice) {
     const name = device.display_name || `DEV-${device.id}`;
     if (!window.confirm(`Отключить устройство "${name}"?`)) return;
+    mutatingRef.current = true;
+    refreshSeqRef.current += 1;
+    setRemovingIds((current) => new Set(current).add(device.id));
+    setData((current) => current ? {
+      ...current,
+      devices: current.devices.filter((item) => item.id !== device.id),
+      active_devices_count: Math.max(0, current.active_devices_count - 1),
+      devices_label: `${Math.max(0, current.active_devices_count - 1)}/${current.device_limit}`,
+    } : current);
     try {
       await api.publicRemoveDevice(userToken, device.id);
       setNotice("Устройство отключено");
-      await refresh(true);
+      await refresh(false, true);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Устройство не отключено");
+      await refresh(true, true);
+    } finally {
+      setRemovingIds((current) => {
+        const next = new Set(current);
+        next.delete(device.id);
+        return next;
+      });
+      mutatingRef.current = false;
     }
   }
 
@@ -246,7 +275,13 @@ function PublicConnectPage({ userToken }: { userToken: string }) {
                   <span className="min-w-0 truncate font-medium" title={device.display_name || `DEV-${device.id}`}>
                     {device.display_name || `DEV-${device.id}`}
                   </span>
-                  <Button variant="secondary" className="h-8 w-8 shrink-0 p-0" onClick={() => removeDevice(device)} title="Отключить устройство">
+                  <Button
+                    variant="secondary"
+                    className="h-8 w-8 shrink-0 p-0"
+                    onClick={() => removeDevice(device)}
+                    disabled={removingIds.has(device.id)}
+                    title="Отключить устройство"
+                  >
                     <XCircle size={16} />
                   </Button>
                 </div>
