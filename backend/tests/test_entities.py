@@ -423,6 +423,43 @@ def test_user_create_duplicate_username_returns_clear_error(client, auth_headers
     assert second.json()["detail"] == "Пользователь с таким логином уже существует"
 
 
+def test_user_create_same_idempotency_key_returns_same_success(client, auth_headers, db_session):
+    headers = {**auth_headers, "X-Idempotency-Key": "create-user-same-request"}
+    payload = {"first_name": "Same", "last_name": "Request", "username": "same-request-user"}
+    first = client.post("/admin/users", headers=headers, json=payload)
+    assert first.status_code == 200
+    second = client.post("/admin/users", headers=headers, json=payload)
+    assert second.status_code == 200
+    assert second.json()["id"] == first.json()["id"]
+    assert second.json()["username"] == "same-request-user"
+
+
+def test_user_create_with_idempotency_requires_and_accepts_csrf(client, auth_headers):
+    response = client.post(
+        "/admin/users",
+        headers={**auth_headers, "X-Idempotency-Key": "csrf-create-ok"},
+        json={"first_name": "Csrf", "last_name": "Ok", "username": "csrf-create-ok"},
+    )
+    assert response.status_code == 200
+    assert response.json()["username"] == "csrf-create-ok"
+
+    duplicate = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={"first_name": "Csrf", "last_name": "Dup", "username": "csrf-create-ok"},
+    )
+    assert duplicate.status_code == 409
+    assert duplicate.json()["detail"] == "Пользователь с таким логином уже существует"
+
+    missing_csrf = client.post(
+        "/admin/users",
+        headers={"X-Idempotency-Key": "csrf-missing"},
+        json={"first_name": "No", "last_name": "Csrf", "username": "csrf-missing"},
+    )
+    assert missing_csrf.status_code == 403
+    assert missing_csrf.json()["detail"] == "Неверный CSRF-токен"
+
+
 def test_delete_user_response_is_parseable_and_repeated_delete_is_ok(client, auth_headers):
     user = client.post(
         "/admin/users",
@@ -436,7 +473,7 @@ def test_delete_user_response_is_parseable_and_repeated_delete_is_ok(client, aut
     assert "apply_status" in body
     repeated = client.delete(f"/admin/users/{user['id']}", headers=auth_headers)
     assert repeated.status_code == 200
-    assert repeated.json()["message"] == "Пользователь помечен как удаленный"
+    assert repeated.json()["message"] == "Пользователь уже удален"
 
 
 def test_user_create_reports_unhandled_apply_exception_as_warning(client, auth_headers, db_session, monkeypatch):

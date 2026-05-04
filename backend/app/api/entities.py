@@ -1,7 +1,9 @@
+import asyncio
 import csv
 import io
 import logging
 import secrets
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, TypeVar
@@ -86,6 +88,9 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 public_router = APIRouter(tags=["subscriptions"])
 ModelT = TypeVar("ModelT")
 logger = logging.getLogger(__name__)
+IDEMPOTENCY_TTL_SECONDS = 300
+_create_user_idempotency_cache: dict[str, dict[str, Any]] = {}
+_create_user_idempotency_locks: dict[str, asyncio.Lock] = {}
 
 
 def _get_or_404(db: Session, model: type[ModelT], item_id: int) -> ModelT:
@@ -200,6 +205,47 @@ async def safe_auto_apply_after_change(
             sorted(node_ids or []),
         )
         return failed_apply_summary_from_exception(db, node_ids, exc)
+
+
+def request_idempotency_key(request: Request) -> str | None:
+    value = (request.headers.get("X-Idempotency-Key") or request.headers.get("X-Request-ID") or "").strip()
+    if not value:
+        return None
+    return value[:120]
+
+
+def cached_created_user(db: Session, key: str) -> VpnUser | None:
+    entry = _create_user_idempotency_cache.get(key)
+    if not entry:
+        return None
+    if time.monotonic() - float(entry.get("stored_at", 0)) > IDEMPOTENCY_TTL_SECONDS:
+        _create_user_idempotency_cache.pop(key, None)
+        _create_user_idempotency_locks.pop(key, None)
+        return None
+    user = db.get(VpnUser, int(entry["user_id"]))
+    if not user:
+        return None
+    if entry.get("apply_status"):
+        setattr(user, "apply_status", entry["apply_status"])
+    if entry.get("apply_error"):
+        setattr(user, "apply_error", entry["apply_error"])
+    return user
+
+
+def cache_created_user(key: str | None, user: VpnUser, summary: ConfigApplySummary | None) -> None:
+    if not key:
+        return
+    apply_status = summary.as_dict() if summary else None
+    errors = []
+    if summary:
+        errors = [result.error for result in summary.results if result.error and (not result.ok or result.status == "skipped")]
+    _create_user_idempotency_cache[key] = {
+        "user_id": user.id,
+        "username": user.username,
+        "apply_status": apply_status,
+        "apply_error": "; ".join(errors) if errors else None,
+        "stored_at": time.monotonic(),
+    }
 
 
 @router.get("/dashboard", response_model=DashboardStats)
@@ -517,11 +563,51 @@ def list_users(_: Admin = Depends(current_admin), db: Session = Depends(get_db))
 
 
 @router.post("/users", response_model=VpnUserRead)
-async def create_user(payload: VpnUserCreate, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> VpnUser:
+async def create_user(
+    payload: VpnUserCreate,
+    request: Request,
+    admin: Admin = Depends(require_write),
+    db: Session = Depends(get_db),
+) -> VpnUser:
+    idempotency_key = request_idempotency_key(request)
+    if idempotency_key:
+        cached = cached_created_user(db, idempotency_key)
+        if cached:
+            logger.info(
+                "create user idempotent cache hit before lock admin_id=%s username=%s request_id=%s user_id=%s",
+                admin.id,
+                payload.username,
+                idempotency_key,
+                cached.id,
+            )
+            return cached
+        lock = _create_user_idempotency_locks.setdefault(idempotency_key, asyncio.Lock())
+        async with lock:
+            cached = cached_created_user(db, idempotency_key)
+            if cached:
+                logger.info(
+                    "create user idempotent cache hit after lock admin_id=%s username=%s request_id=%s user_id=%s",
+                    admin.id,
+                    payload.username,
+                    idempotency_key,
+                    cached.id,
+                )
+                return cached
+            return await create_user_unlocked(payload, admin, db, idempotency_key)
+    return await create_user_unlocked(payload, admin, db, None)
+
+
+async def create_user_unlocked(
+    payload: VpnUserCreate,
+    admin: Admin,
+    db: Session,
+    idempotency_key: str | None,
+) -> VpnUser:
     logger.info(
-        "create user start admin_id=%s username=%s status=%s department_id=%s profile_id=%s nodes=%s primary_node_id=%s",
+        "create user start admin_id=%s username=%s request_id=%s status=%s department_id=%s profile_id=%s nodes=%s primary_node_id=%s",
         admin.id,
         payload.username,
+        idempotency_key,
         payload.status,
         payload.department_id,
         payload.access_profile_id,
@@ -529,7 +615,7 @@ async def create_user(payload: VpnUserCreate, admin: Admin = Depends(require_wri
         payload.primary_node_id,
     )
     if db.scalar(select(VpnUser.id).where(VpnUser.username == payload.username)):
-        logger.info("create user validation failed duplicate_username admin_id=%s username=%s", admin.id, payload.username)
+        logger.info("create user validation failed duplicate_username admin_id=%s username=%s request_id=%s", admin.id, payload.username, idempotency_key)
         raise HTTPException(status_code=409, detail="Пользователь с таким логином уже существует")
     expires_at = payload.expires_at
     profile = db.get(AccessProfile, payload.access_profile_id) if payload.access_profile_id else None
@@ -553,9 +639,9 @@ async def create_user(payload: VpnUserCreate, admin: Admin = Depends(require_wri
         db.flush()
     except IntegrityError as exc:
         db.rollback()
-        logger.exception("create user flush failed admin_id=%s username=%s", admin.id, payload.username)
+        logger.exception("create user flush failed admin_id=%s username=%s request_id=%s", admin.id, payload.username, idempotency_key)
         raise HTTPException(status_code=409, detail="Пользователь с таким логином уже существует") from exc
-    logger.info("create user db flushed admin_id=%s user_id=%s username=%s", admin.id, user.id, user.username)
+    logger.info("create user db flushed admin_id=%s user_id=%s username=%s request_id=%s", admin.id, user.id, user.username, idempotency_key)
     _, new_ids = set_user_node_access(db, user, allowed_node_ids, payload.primary_node_id)
     audit(db, "create", "vpn_user", user.id, admin.id)
     summary = await safe_auto_apply_after_change(db, admin, new_ids, "auto_apply_after_user_create")
@@ -563,23 +649,26 @@ async def create_user(payload: VpnUserCreate, admin: Admin = Depends(require_wri
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        logger.exception("create user commit failed admin_id=%s user_id=%s username=%s", admin.id, user.id, payload.username)
+        logger.exception("create user commit failed admin_id=%s user_id=%s username=%s request_id=%s", admin.id, user.id, payload.username, idempotency_key)
         raise HTTPException(status_code=409, detail="Пользователь с таким логином уже существует") from exc
+    cache_created_user(idempotency_key, user, summary)
     if summary.ok:
         logger.info(
-            "create user response success admin_id=%s user_id=%s username=%s apply_attempted=%s apply_skipped=%s",
+            "create user response success admin_id=%s user_id=%s username=%s request_id=%s apply_attempted=%s apply_skipped=%s",
             admin.id,
             user.id,
             user.username,
+            idempotency_key,
             summary.attempted,
             summary.skipped,
         )
     else:
         logger.warning(
-            "create user response partial_success admin_id=%s user_id=%s username=%s apply_failed=%s apply_skipped=%s",
+            "create user response partial_success admin_id=%s user_id=%s username=%s request_id=%s apply_failed=%s apply_skipped=%s",
             admin.id,
             user.id,
             user.username,
+            idempotency_key,
             summary.failed,
             summary.skipped,
         )
@@ -626,10 +715,21 @@ async def update_user(user_id: int, payload: VpnUserCreate, admin: Admin = Depen
 async def delete_user(user_id: int, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> Message:
     user = _get_or_404(db, VpnUser, user_id)
     affected_ids = set(user.allowed_node_ids or [])
+    logger.info("delete user start admin_id=%s user_id=%s status=%s nodes=%s", admin.id, user.id, user.status, sorted(affected_ids))
+    if user.status == UserStatus.deleted.value:
+        logger.info("delete user already_deleted admin_id=%s user_id=%s", admin.id, user.id)
+        return Message(message="Пользователь уже удален")
     user.status = UserStatus.deleted.value
     audit(db, "delete", "vpn_user", user.id, admin.id)
-    summary = await auto_apply_after_change(db, admin, affected_ids, "auto_apply_after_user_delete")
+    summary = await safe_auto_apply_after_change(db, admin, affected_ids, "auto_apply_after_user_delete")
     db.commit()
+    logger.info(
+        "delete user response success admin_id=%s user_id=%s apply_failed=%s apply_skipped=%s",
+        admin.id,
+        user.id,
+        summary.failed,
+        summary.skipped,
+    )
     return Message(
         message="Пользователь помечен как удаленный",
         diagnostics=apply_warning("Пользователь удален", summary),

@@ -263,16 +263,17 @@ let csrfToken = localStorage.getItem("akfa_csrf") || "";
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const isFormData = options.body instanceof FormData;
+  const { headers: optionHeaders, ...fetchOptions } = options;
   let response: Response;
   try {
     response = await fetch(path, {
+      ...fetchOptions,
       credentials: "include",
       headers: {
         ...(isFormData ? {} : { "Content-Type": "application/json" }),
         ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
-        ...(options.headers || {})
-      },
-      ...options
+        ...(optionHeaders || {})
+      }
     });
   } catch (error) {
     throw new Error("Не удалось связаться с сервером. Проверьте соединение и обновите страницу.");
@@ -415,8 +416,12 @@ export const api = {
   publicConnect(token: string) {
     return request<PublicConnect>(`/public/connect/${token}`);
   },
-  createUser(payload: Record<string, unknown>) {
-    return request<VpnUser>("/admin/users", { method: "POST", body: JSON.stringify(payload) });
+  createUser(payload: Record<string, unknown>, idempotencyKey?: string) {
+    return request<VpnUser>("/admin/users", {
+      method: "POST",
+      headers: idempotencyKey ? { "X-Idempotency-Key": idempotencyKey } : undefined,
+      body: JSON.stringify(payload)
+    });
   },
   updateUser(id: number, payload: Record<string, unknown>) {
     return request<VpnUser>(`/admin/users/${id}`, { method: "PUT", body: JSON.stringify(payload) });

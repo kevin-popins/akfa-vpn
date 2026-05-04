@@ -420,6 +420,7 @@ function AdminPages({
   const [selectedProfile, setSelectedProfile] = useState<AccessProfile | null>(null);
   const [operation, setOperation] = useState<OperationState>(null);
   const [deletingUserIds, setDeletingUserIds] = useState<Set<number>>(new Set());
+  const deletingUserIdsRef = useRef<Set<number>>(new Set());
   const [preview, setPreview] = useState<PreviewState>({
     title: "Предпросмотр подписки",
     empty: "Подписка появится после создания активного пользователя и сервера.",
@@ -629,12 +630,15 @@ function AdminPages({
   }
 
   async function deleteUser(user: VpnUser) {
+    if (deletingUserIdsRef.current.has(user.id)) return;
     setConfirm({
       title: "Удалить пользователя VPN?",
       text: `Удалить пользователя ${user.last_name} ${user.first_name}? Пользователь будет отключён, его устройства будут убраны из конфигурации.`,
       confirmLabel: "Удалить",
       onConfirm: async () => {
+        if (deletingUserIdsRef.current.has(user.id)) return;
         setConfirm(null);
+        deletingUserIdsRef.current.add(user.id);
         setDeletingUserIds((current) => new Set(current).add(user.id));
         setOperation({ title: "Удаление пользователя", message: "Удаляем пользователя...", tone: "pending" });
         const applyTimer = window.setTimeout(() => setOperation({ title: "Удаление пользователя", message: "Применяем конфигурацию...", tone: "pending" }), 250);
@@ -658,6 +662,7 @@ function AdminPages({
           window.clearTimeout(applyTimer);
           setOperation({ title: "Ошибка удаления", message: `Ошибка: ${error instanceof Error ? error.message : "Пользователь не удален"}`, tone: "error" });
         } finally {
+          deletingUserIdsRef.current.delete(user.id);
           setDeletingUserIds((current) => {
             const next = new Set(current);
             next.delete(user.id);
@@ -1862,6 +1867,7 @@ function UsersPage({
   const [grouped, setGrouped] = useState(false);
   const [creating, setCreating] = useState(false);
   const [operation, setOperation] = useState<OperationState>(null);
+  const createInFlightRef = useRef(false);
   const activeNodeIds = useMemo(() => nodes.filter((node) => node.status === "online").map((node) => node.id), [nodes]);
 
   useEffect(() => {
@@ -1874,6 +1880,7 @@ function UsersPage({
   }, [activeNodeIds, form.allowed_node_ids.length]);
 
   async function create() {
+    if (createInFlightRef.current) return;
     if (!form.first_name.trim() || !form.last_name.trim() || !form.username.trim()) {
       onNotice("Укажите имя, фамилию и логин пользователя");
       return;
@@ -1884,12 +1891,16 @@ function UsersPage({
     }
     if (creating) return;
     const payload = userPayload(form);
+    const username = form.username.trim();
+    const existedBefore = users.some((user) => user.username === username);
+    const requestId = newRequestId();
+    createInFlightRef.current = true;
     setCreating(true);
     let applyTimer: number | null = null;
     try {
       setOperation({ title: "Создание пользователя", message: "Создаём пользователя...", tone: "pending" });
       applyTimer = window.setTimeout(() => setOperation({ title: "Создание пользователя", message: "Применяем конфигурацию...", tone: "pending" }), 250);
-      const created = await api.createUser(payload);
+      const created = await api.createUser(payload, requestId);
       if (applyTimer) window.clearTimeout(applyTimer);
       setForm({ ...defaultUserForm, allowed_node_ids: activeNodeIds, primary_node_id: activeNodeIds[0] ? String(activeNodeIds[0]) : "" });
       const message = formatApplyStatusMessage("Пользователь успешно добавлен", created.apply_status, "Пользователь создан, но конфигурация не применена");
@@ -1903,8 +1914,33 @@ function UsersPage({
       }
     } catch (error) {
       if (applyTimer) window.clearTimeout(applyTimer);
-      setOperation({ title: "Ошибка создания", message: `Ошибка: ${error instanceof Error ? error.message : "Пользователь не создан"}`, tone: "error" });
+      const message = error instanceof Error ? error.message : "Пользователь не создан";
+      if (message.includes("таким логином") && !existedBefore) {
+        try {
+          const fresh = visibleUsers(await api.users());
+          const created = fresh.find((user) => user.username === username);
+          if (created) {
+            await onCreated(created);
+            setForm({ ...defaultUserForm, allowed_node_ids: activeNodeIds, primary_node_id: activeNodeIds[0] ? String(activeNodeIds[0]) : "" });
+            setOperation({
+              title: "Пользователь создан",
+              message: "Пользователь успешно добавлен. Повторный запрос был проигнорирован.",
+              tone: "success"
+            });
+            return;
+          }
+        } catch {
+          setOperation({
+            title: "Пользователь создан",
+            message: "Пользователь мог быть создан, но список не обновился. Нажмите Обновить.",
+            tone: "warning"
+          });
+          return;
+        }
+      }
+      setOperation({ title: "Ошибка создания", message: `Ошибка: ${message}`, tone: "error" });
     } finally {
+      createInFlightRef.current = false;
       setCreating(false);
     }
   }
@@ -3321,6 +3357,11 @@ function userPayload(form: typeof defaultUserForm) {
     expires_at: form.expires_at ? new Date(form.expires_at).toISOString() : null,
     status: form.status
   };
+}
+
+function newRequestId() {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 function userFormFromUser(user: VpnUser): typeof defaultUserForm {
