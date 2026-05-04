@@ -6,7 +6,7 @@ from urllib.parse import parse_qs, urlparse
 from app.models import VpnUserDevice, VpsNode
 from app.services.ssh_installer import InstallResult, XrayInstaller
 from app.services.config_apply import ConfigApplyService
-from app.services.xray_config import render_server_config
+from app.services.xray_config import clean_server_name, render_server_config
 
 
 @pytest.fixture(autouse=True)
@@ -26,6 +26,21 @@ def fake_xray_apply(monkeypatch):
     monkeypatch.setattr(XrayInstaller, "apply_config", fake_apply)
     monkeypatch.setattr("app.services.config_apply.node_has_installed_xray", lambda node: True)
     return calls
+
+
+@pytest.mark.parametrize(
+    ("alias", "expected"),
+    [
+        ("nl", "AKFA 🇳🇱 Нидерланды"),
+        ("ie", "AKFA 🇮🇪 Ирландия"),
+        ("france", "AKFA 🇫🇷 Франция"),
+        ("сша", "AKFA 🇺🇸 США"),
+        ("singapore", "AKFA 🇸🇬 Сингапур"),
+    ],
+)
+def test_clean_server_name_country_aliases(alias, expected):
+    node = VpsNode(name="Fallback", location=alias, ip_address="203.0.113.10", ssh_username="root")
+    assert clean_server_name(node) == expected
 
 
 def test_config_preview_contains_required_reality_fields(client, auth_headers):
