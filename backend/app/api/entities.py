@@ -622,28 +622,44 @@ async def update_user_device(
     return device
 
 
-@router.post("/users/{user_id}/devices/{device_id}/revoke", response_model=VpnUserDeviceRead)
-async def revoke_user_device(user_id: int, device_id: int, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> VpnUserDevice:
+@router.post("/users/{user_id}/devices/{device_id}/revoke", response_model=Message)
+async def revoke_user_device(user_id: int, device_id: int, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> Message:
     user = _get_or_404(db, VpnUser, user_id)
     device = _get_or_404(db, VpnUserDevice, device_id)
     if device.vpn_user_id != user.id:
         raise HTTPException(status_code=404, detail="Устройство не найдено")
-    device.status = DeviceStatus.revoked.value
-    audit(db, "revoke_device", "vpn_user_device", device.id, admin.id)
-    await auto_apply_after_change(db, admin, set(user.allowed_node_ids or []), "auto_apply_after_device_revoke")
+    device_id_for_audit = device.id
+    try:
+        summary = await _remove_device_and_apply(db, user, device, reason="auto_apply_after_device_remove", admin_id=admin.id)
+    except ConfigApplyRequiredError as exc:
+        db.rollback()
+        raise HTTPException(status_code=502, detail=str(exc) or "Конфиг Xray не удалось применить") from exc
+    audit(db, "remove_device", "vpn_user_device", device_id_for_audit, admin.id)
     db.commit()
-    return device
+    return Message(message="Устройство удалено", apply_status=summary.as_dict() if summary else None)
 
 
 @router.post("/users/{user_id}/devices/reset", response_model=list[VpnUserDeviceRead])
 async def reset_user_devices(user_id: int, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> list[VpnUserDevice]:
     user = _get_or_404(db, VpnUser, user_id)
-    for device in user.devices:
-        device.status = DeviceStatus.revoked.value
+    for device in list(user.devices):
+        db.delete(device)
+    db.flush()
     audit(db, "reset_devices", "vpn_user", user.id, admin.id)
-    await auto_apply_after_change(db, admin, set(user.allowed_node_ids or []), "auto_apply_after_devices_reset")
+    if affected_node_ids_for_user(user):
+        try:
+            await apply_config_for_user(
+                db,
+                user,
+                reason="auto_apply_after_devices_reset",
+                admin_id=admin.id,
+                require_success=True,
+            )
+        except ConfigApplyRequiredError as exc:
+            db.rollback()
+            raise HTTPException(status_code=502, detail=str(exc) or "Конфиг Xray не удалось применить") from exc
     db.commit()
-    return user.devices
+    return []
 
 
 @router.post("/users/import", response_model=BulkImportResult)
@@ -826,6 +842,27 @@ def _touch_device_from_context(device: VpnUserDevice, context, db: Session) -> N
     db.flush()
 
 
+async def _remove_device_and_apply(
+    db: Session,
+    user: VpnUser,
+    device: VpnUserDevice,
+    *,
+    reason: str,
+    admin_id: int | None = None,
+) -> ConfigApplySummary | None:
+    db.delete(device)
+    db.flush()
+    if not affected_node_ids_for_user(user):
+        return None
+    return await apply_config_for_user(
+        db,
+        user,
+        reason=reason,
+        admin_id=admin_id,
+        require_success=True,
+    )
+
+
 async def _apply_for_subscription(db: Session, user: VpnUser) -> ConfigApplySummary:
     return await apply_config_for_user(
         db,
@@ -859,6 +896,21 @@ def deprecated_install_link(user_token: str) -> Response:
         status_code=status.HTTP_410_GONE,
         media_type="text/plain; charset=utf-8",
     )
+
+
+@public_router.delete("/public/connect/{user_token}/devices/{device_id}", response_model=Message)
+async def public_disconnect_device(user_token: str, device_id: int, db: Session = Depends(get_db)) -> Message:
+    user = validate_subscription_user(db.scalar(select(VpnUser).where(VpnUser.subscription_token == user_token)))
+    device = db.get(VpnUserDevice, device_id)
+    if not device or device.vpn_user_id != user.id:
+        raise HTTPException(status_code=404, detail="Устройство не найдено")
+    try:
+        summary = await _remove_device_and_apply(db, user, device, reason="auto_apply_after_public_device_remove")
+    except ConfigApplyRequiredError as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="Не удалось применить конфигурацию на сервер") from exc
+    db.commit()
+    return Message(message="Устройство удалено", apply_status=summary.as_dict() if summary else None)
 
 
 @public_router.get("/sub/device/{device_token}")
@@ -908,14 +960,15 @@ async def subscription(
         )
     )
     if device:
-        if device.status != DeviceStatus.active.value:
-            return _plain_forbidden("Устройство отключено")
-        _touch_device_from_context(device, context, db)
-        db.commit()
-        response = subscription_response(db, user, device, format)
-        response.headers["x-hwid-limit"] = "true"
-        response.headers["x-hwid-active"] = "true"
-        return response
+        if device.status == DeviceStatus.active.value:
+            _touch_device_from_context(device, context, db)
+            db.commit()
+            response = subscription_response(db, user, device, format)
+            response.headers["x-hwid-limit"] = "true"
+            response.headers["x-hwid-active"] = "true"
+            return response
+        db.delete(device)
+        db.flush()
 
     db.expire(user, ["devices", "node_links", "access_profile"])
     if user.active_devices_count >= user.device_limit:

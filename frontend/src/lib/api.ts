@@ -397,10 +397,13 @@ export const api = {
     return request<VpnUserDevice[]>(`/admin/users/${id}/devices`);
   },
   revokeDevice(userId: number, deviceId: number) {
-    return request<VpnUserDevice>(`/admin/users/${userId}/devices/${deviceId}/revoke`, { method: "POST" });
+    return request<{ message: string }>(`/admin/users/${userId}/devices/${deviceId}/revoke`, { method: "POST" });
   },
   resetDevices(userId: number) {
     return request<VpnUserDevice[]>(`/admin/users/${userId}/devices/reset`, { method: "POST" });
+  },
+  publicRemoveDevice(token: string, deviceId: number) {
+    return request<{ message: string }>(`/public/connect/${token}/devices/${deviceId}`, { method: "DELETE" });
   },
   deleteUser(id: number) {
     return request<{ message: string; diagnostics?: string; apply_status?: ConfigApplySummary | null }>(`/admin/users/${id}`, { method: "DELETE" });

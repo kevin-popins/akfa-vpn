@@ -172,20 +172,57 @@ def test_device_revoke_and_reset_auto_apply_remove_hwid_clients(client, auth_hea
     created = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "revoke-phone"})
     assert created.status_code == 200
     device = db_session.query(VpnUserDevice).filter_by(vpn_user_id=user["id"]).one()
+    old_device_token = device.subscription_token
+    old_device_uuid = device.uuid
     assert device.uuid in fake_xray_apply[-1]["config"]
 
     revoked = client.post(f"/admin/users/{user['id']}/devices/{device.id}/revoke", headers=auth_headers)
     assert revoked.status_code == 200
-    assert device.uuid not in fake_xray_apply[-1]["config"]
+    assert old_device_uuid not in fake_xray_apply[-1]["config"]
+    assert client.get(f"/sub/device/{old_device_token}", headers={"x-hwid": "revoke-phone"}).status_code == 404
+    assert db_session.query(VpnUserDevice).filter_by(vpn_user_id=user["id"]).count() == 0
 
-    second = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "revoke-phone-2"})
-    assert second.status_code == 200
+    recreated = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "revoke-phone"})
+    assert recreated.status_code == 200
     second_device = db_session.query(VpnUserDevice).filter_by(vpn_user_id=user["id"], status="active").one()
+    assert second_device.uuid != old_device_uuid
     assert second_device.uuid in fake_xray_apply[-1]["config"]
 
     reset = client.post(f"/admin/users/{user['id']}/devices/reset", headers=auth_headers)
     assert reset.status_code == 200
     assert second_device.uuid not in fake_xray_apply[-1]["config"]
+    assert db_session.query(VpnUserDevice).filter_by(vpn_user_id=user["id"]).count() == 0
+
+
+def test_public_connect_can_remove_device_and_same_hwid_registers_again(client, auth_headers, db_session, fake_xray_apply):
+    node_payload = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "Public remove", "ip_address": "203.0.113.94", "ssh_username": "root", "ssh_password": "secret"},
+    ).json()
+    node = db_session.get(VpsNode, node_payload["id"])
+    node.status = "online"
+    db_session.commit()
+    user = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={"first_name": "Public", "last_name": "Remove", "username": "public-remove", "device_limit": 1},
+    ).json()
+    created = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "public-phone"})
+    assert created.status_code == 200
+    device = db_session.query(VpnUserDevice).filter_by(vpn_user_id=user["id"]).one()
+    old_uuid = device.uuid
+
+    removed = client.delete(f"/public/connect/{user['subscription_token']}/devices/{device.id}")
+    assert removed.status_code == 200
+    assert db_session.query(VpnUserDevice).filter_by(vpn_user_id=user["id"]).count() == 0
+    assert old_uuid not in fake_xray_apply[-1]["config"]
+
+    recreated = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "public-phone"})
+    assert recreated.status_code == 200
+    new_device = db_session.query(VpnUserDevice).filter_by(vpn_user_id=user["id"]).one()
+    assert new_device.uuid != old_uuid
+    assert new_device.uuid in recreated.text
 
 
 def test_device_subscription_requires_matching_hwid_and_clash_is_yaml(client, auth_headers, db_session):

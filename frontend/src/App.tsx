@@ -141,13 +141,28 @@ function PublicConnectPage({ userToken }: { userToken: string }) {
   const [data, setData] = useState<PublicConnect | null>(null);
   const [selected, setSelected] = useState("android-happ");
   const [notice, setNotice] = useState("");
+  const [loading, setLoading] = useState(true);
+
+  const refresh = useCallback(async (silent = false) => {
+    try {
+      const next = await api.publicConnect(userToken);
+      setData(next);
+      if (!silent) setNotice("");
+    } catch (error) {
+      setData(null);
+      setNotice(error instanceof Error ? error.message : "Подключение недоступно");
+    } finally {
+      setLoading(false);
+    }
+  }, [userToken]);
 
   useEffect(() => {
-    api
-      .publicConnect(userToken)
-      .then(setData)
-      .catch((error) => setNotice(error instanceof Error ? error.message : "Подключение недоступно"));
-  }, [userToken]);
+    void refresh();
+    const timer = window.setInterval(() => {
+      void refresh(true);
+    }, 7000);
+    return () => window.clearInterval(timer);
+  }, [refresh]);
 
   const options = connectOptions(userToken);
   const current = options.find((item) => item.id === selected) || options[0];
@@ -156,6 +171,19 @@ function PublicConnectPage({ userToken }: { userToken: string }) {
   async function copyLink(value: string) {
     await navigator.clipboard.writeText(value);
     setNotice("Ссылка скопирована");
+    void refresh(true);
+  }
+
+  async function removeDevice(device: VpnUserDevice) {
+    const name = device.display_name || `DEV-${device.id}`;
+    if (!window.confirm(`Отключить устройство "${name}"?`)) return;
+    try {
+      await api.publicRemoveDevice(userToken, device.id);
+      setNotice("Устройство отключено");
+      await refresh(true);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Устройство не отключено");
+    }
   }
 
   return (
@@ -170,21 +198,17 @@ function PublicConnectPage({ userToken }: { userToken: string }) {
           {data ? <div className="rounded-md border border-akfa-line px-3 py-2 text-sm">Устройства: <b>{data.devices_label}</b></div> : null}
         </header>
         {notice ? <Message tone={notice.includes("скопирована") ? "success" : "error"} text={notice} /> : null}
-        {data ? (
-          <section className="grid gap-2 text-sm md:grid-cols-4">
-            <Line k="Пользователь" v={data.display_name} />
-            <Line k="Статус" v={translateStatus(data.status)} />
-            <Line k="Срок" v={data.expires_at ? formatDate(data.expires_at) : "Без срока"} />
-            <Line k="Трафик" v={`${formatBytes(data.used_traffic)}${data.traffic_limit ? ` / ${formatBytes(data.traffic_limit)}` : ""}`} />
-          </section>
-        ) : null}
+        {loading ? <Message tone="success" text="Загрузка подключения..." /> : null}
         {limitReached ? <Message tone="warning" text="Лимит устройств исчерпан. Новое устройство не сможет получить конфиг." /> : null}
         <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           {options.map((option) => (
             <button
               key={option.id}
               className={`rounded-md border p-4 text-left transition ${selected === option.id ? "border-akfa-red bg-red-50" : "border-akfa-line hover:border-akfa-red/50"}`}
-              onClick={() => setSelected(option.id)}
+              onClick={() => {
+                setSelected(option.id);
+                void refresh(true);
+              }}
             >
               <div className="font-semibold">{option.title}</div>
               <div className="mt-1 text-sm text-akfa-muted">{option.client}</div>
@@ -214,19 +238,21 @@ function PublicConnectPage({ userToken }: { userToken: string }) {
           </CardContent>
         </Card>
         {data?.devices.length ? (
-          <Card>
-            <CardHeader><h2 className="font-semibold">Устройства</h2></CardHeader>
-            <CardContent className="grid gap-2">
+          <section className="grid gap-2">
+            <h2 className="font-semibold">Устройства</h2>
+            <div className="divide-y divide-akfa-line rounded-md border border-akfa-line">
               {data.devices.map((device) => (
-                <div key={device.id} className="grid gap-1 rounded-md border border-akfa-line p-3 text-sm md:grid-cols-4">
-                  <Line k="Название" v={device.display_name || `DEV-${device.id}`} />
-                  <Line k="Платформа" v={device.platform || "-"} />
-                  <Line k="Клиент" v={device.client_name || "-"} />
-                  <Line k="Статус" v={translateStatus(device.status)} />
+                <div key={device.id} className="flex items-center justify-between gap-3 px-3 py-3 text-sm">
+                  <span className="min-w-0 truncate font-medium" title={device.display_name || `DEV-${device.id}`}>
+                    {device.display_name || `DEV-${device.id}`}
+                  </span>
+                  <Button variant="secondary" className="h-8 w-8 shrink-0 p-0" onClick={() => removeDevice(device)} title="Отключить устройство">
+                    <XCircle size={16} />
+                  </Button>
                 </div>
               ))}
-            </CardContent>
-          </Card>
+            </div>
+          </section>
         ) : null}
       </main>
     </div>
