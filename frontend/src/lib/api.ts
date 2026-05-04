@@ -103,6 +103,7 @@ export type VpnUser = {
   created_at: string;
   updated_at: string;
   apply_status?: ConfigApplySummary | null;
+  apply_error?: string | null;
 };
 
 export type VpnUserDevice = {
@@ -262,15 +263,20 @@ let csrfToken = localStorage.getItem("akfa_csrf") || "";
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const isFormData = options.body instanceof FormData;
-  const response = await fetch(path, {
-    credentials: "include",
-    headers: {
-      ...(isFormData ? {} : { "Content-Type": "application/json" }),
-      ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
-      ...(options.headers || {})
-    },
-    ...options
-  });
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      credentials: "include",
+      headers: {
+        ...(isFormData ? {} : { "Content-Type": "application/json" }),
+        ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
+        ...(options.headers || {})
+      },
+      ...options
+    });
+  } catch (error) {
+    throw new Error("Не удалось связаться с сервером. Проверьте соединение и обновите страницу.");
+  }
   if (!response.ok) {
     const text = await response.text();
     let message = text || `HTTP ${response.status}`;
@@ -299,7 +305,13 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     throw new Error(message);
   }
   if (response.status === 204) return undefined as T;
-  return response.json() as Promise<T>;
+  const text = await response.text();
+  if (!text.trim()) return undefined as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return text as T;
+  }
 }
 
 export const api = {

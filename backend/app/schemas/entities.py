@@ -192,6 +192,7 @@ class VpnUserRead(VpnUserBase, OrmModel):
     created_at: datetime
     updated_at: datetime
     apply_status: ConfigApplySummaryRead | None = None
+    apply_error: str | None = None
 
 
 class VpnUserDeviceRead(OrmModel):

@@ -403,7 +403,40 @@ def test_user_create_with_apply_warning_returns_structured_success_not_false_500
     assert body["apply_status"]["ok"] is False
     assert body["apply_status"]["failed"] == 1
     assert "controlled warning" in body["apply_status"]["results"][0]["error"]
+    assert "controlled warning" in body["apply_error"]
     assert db_session.query(VpnUser).filter_by(username="apply.warning").first() is not None
+
+
+def test_user_create_duplicate_username_returns_clear_error(client, auth_headers, db_session):
+    first = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={"first_name": "Dup", "last_name": "User", "username": "duplicate-user"},
+    )
+    assert first.status_code == 200
+    second = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={"first_name": "Dup", "last_name": "Again", "username": "duplicate-user"},
+    )
+    assert second.status_code == 409
+    assert second.json()["detail"] == "Пользователь с таким логином уже существует"
+
+
+def test_delete_user_response_is_parseable_and_repeated_delete_is_ok(client, auth_headers):
+    user = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={"first_name": "Delete", "last_name": "Parse", "username": "delete-parse"},
+    ).json()
+    response = client.delete(f"/admin/users/{user['id']}", headers=auth_headers)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["message"] == "Пользователь помечен как удаленный"
+    assert "apply_status" in body
+    repeated = client.delete(f"/admin/users/{user['id']}", headers=auth_headers)
+    assert repeated.status_code == 200
+    assert repeated.json()["message"] == "Пользователь помечен как удаленный"
 
 
 def test_user_create_reports_unhandled_apply_exception_as_warning(client, auth_headers, db_session, monkeypatch):

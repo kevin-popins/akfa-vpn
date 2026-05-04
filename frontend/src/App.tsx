@@ -418,6 +418,8 @@ function AdminPages({
   const [selectedUser, setSelectedUser] = useState<VpnUser | null>(null);
   const [selectedNode, setSelectedNode] = useState<NodeRead | null>(null);
   const [selectedProfile, setSelectedProfile] = useState<AccessProfile | null>(null);
+  const [operation, setOperation] = useState<OperationState>(null);
+  const [deletingUserIds, setDeletingUserIds] = useState<Set<number>>(new Set());
   const [preview, setPreview] = useState<PreviewState>({
     title: "Предпросмотр подписки",
     empty: "Подписка появится после создания активного пользователя и сервера.",
@@ -629,18 +631,38 @@ function AdminPages({
   async function deleteUser(user: VpnUser) {
     setConfirm({
       title: "Удалить пользователя VPN?",
-      text: `Удалить пользователя ${user.last_name} ${user.first_name}? Пользователь исчезнет из AKFA и будет исключен из Xray config.`,
+      text: `Удалить пользователя ${user.last_name} ${user.first_name}? Пользователь будет отключён, его устройства будут убраны из конфигурации.`,
       confirmLabel: "Удалить",
       onConfirm: async () => {
         setConfirm(null);
+        setDeletingUserIds((current) => new Set(current).add(user.id));
+        setOperation({ title: "Удаление пользователя", message: "Удаляем пользователя...", tone: "pending" });
+        const applyTimer = window.setTimeout(() => setOperation({ title: "Удаление пользователя", message: "Применяем конфигурацию...", tone: "pending" }), 250);
         try {
           const result = await api.deleteUser(user.id);
+          window.clearTimeout(applyTimer);
           setUsers((items) => items.filter((item) => item.id !== user.id));
           setSelectedUser((current) => (current?.id === user.id ? null : current));
-          onNotice(result.diagnostics || "Пользователь удален");
-          await refresh();
+          const message = result.diagnostics || formatApplyStatusMessage("Пользователь удалён", result.apply_status, "Пользователь удалён, но конфигурация не применена");
+          const tone = applyStatusHasProblems(result.apply_status) ? "warning" : "success";
+          try {
+            await refresh();
+            setPage("users");
+            setOperation({ title: "Удаление пользователя", message, tone });
+          } catch (refreshError) {
+            const refreshMessage = refreshError instanceof Error ? refreshError.message : "список не обновился";
+            setPage("users");
+            setOperation({ title: "Пользователь удалён", message: `${message}. Операция выполнена, но список не обновился: ${refreshMessage}`, tone: "warning" });
+          }
         } catch (error) {
-          onNotice(error instanceof Error ? error.message : "Пользователь не удален");
+          window.clearTimeout(applyTimer);
+          setOperation({ title: "Ошибка удаления", message: `Ошибка: ${error instanceof Error ? error.message : "Пользователь не удален"}`, tone: "error" });
+        } finally {
+          setDeletingUserIds((current) => {
+            const next = new Set(current);
+            next.delete(user.id);
+            return next;
+          });
         }
       }
     });
@@ -769,6 +791,7 @@ function AdminPages({
           setPage("user-detail");
         }}
         onDelete={deleteUser}
+        deletingUserIds={deletingUserIds}
         onNotice={onNotice}
       />
     ),
@@ -808,6 +831,7 @@ function AdminPages({
         onCancel={() => setConfirm(null)}
         onConfirm={() => confirm?.onConfirm()}
       />
+      <OperationPopup state={operation} onClose={() => setOperation(null)} />
     </>
   );
 }
@@ -1818,6 +1842,7 @@ function UsersPage({
   onCreated,
   onSelect,
   onDelete,
+  deletingUserIds,
   onNotice
 }: {
   users: VpnUser[];
@@ -1827,6 +1852,7 @@ function UsersPage({
   onCreated: (user: VpnUser) => void | Promise<void>;
   onSelect: (user: VpnUser) => void;
   onDelete: (user: VpnUser) => void;
+  deletingUserIds?: Set<number>;
   onNotice: (value: string) => void;
 }) {
   const [form, setForm] = useState(defaultUserForm);
@@ -1937,7 +1963,7 @@ function UsersPage({
                     </span>
                   </summary>
                   <div className="p-2">
-                    <UsersTable users={group.users} departments={departments} profiles={profiles} onSelect={onSelect} onDelete={onDelete} />
+              <UsersTable users={group.users} departments={departments} profiles={profiles} onSelect={onSelect} onDelete={onDelete} deletingUserIds={deletingUserIds} />
                   </div>
                 </details>
                 ))}
@@ -1945,7 +1971,7 @@ function UsersPage({
             )
           ) : (
             <div className="w-full">
-              <UsersTable users={filteredUsers} departments={departments} profiles={profiles} onSelect={onSelect} onDelete={onDelete} />
+              <UsersTable users={filteredUsers} departments={departments} profiles={profiles} onSelect={onSelect} onDelete={onDelete} deletingUserIds={deletingUserIds} />
             </div>
           )}
         </CardContent>
@@ -2014,13 +2040,15 @@ function UsersTable({
   departments,
   profiles,
   onSelect,
-  onDelete
+  onDelete,
+  deletingUserIds
 }: {
   users: VpnUser[];
   departments: Department[];
   profiles: AccessProfile[];
   onSelect: (user: VpnUser) => void;
   onDelete: (user: VpnUser) => void;
+  deletingUserIds?: Set<number>;
 }) {
   if (!users.length) return <EmptyPanel title="Ничего не найдено" text="Измените поиск или фильтры." />;
   return (
@@ -2055,7 +2083,7 @@ function UsersTable({
               <td className="px-3 py-2">
                 <div className="flex flex-nowrap justify-end gap-1">
                   <Button className="h-8 w-8 px-0" variant="secondary" title="Доступ и подписка" aria-label="Доступ и подписка" onClick={() => onSelect(user)}><Link2 size={15} /></Button>
-                  <Button className="h-8 w-8 px-0" variant="danger" title="Удалить" aria-label="Удалить" onClick={() => onDelete(user)}><Trash2 size={15} /></Button>
+                  <Button className="h-8 w-8 px-0" variant="danger" title="Удалить" aria-label="Удалить" disabled={deletingUserIds?.has(user.id)} onClick={() => onDelete(user)}><Trash2 size={15} /></Button>
                 </div>
               </td>
             </tr>

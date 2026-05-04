@@ -98,6 +98,9 @@ def _get_or_404(db: Session, model: type[ModelT], item_id: int) -> ModelT:
 def attach_apply_status(item: object, summary: ConfigApplySummary | None) -> object:
     if summary is not None:
         setattr(item, "apply_status", summary.as_dict())
+        errors = [result.error for result in summary.results if result.error and (not result.ok or result.status == "skipped")]
+        if errors:
+            setattr(item, "apply_error", "; ".join(errors))
     return item
 
 
@@ -515,7 +518,19 @@ def list_users(_: Admin = Depends(current_admin), db: Session = Depends(get_db))
 
 @router.post("/users", response_model=VpnUserRead)
 async def create_user(payload: VpnUserCreate, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> VpnUser:
-    logger.info("create user start admin_id=%s username=%s", admin.id, payload.username)
+    logger.info(
+        "create user start admin_id=%s username=%s status=%s department_id=%s profile_id=%s nodes=%s primary_node_id=%s",
+        admin.id,
+        payload.username,
+        payload.status,
+        payload.department_id,
+        payload.access_profile_id,
+        payload.allowed_node_ids,
+        payload.primary_node_id,
+    )
+    if db.scalar(select(VpnUser.id).where(VpnUser.username == payload.username)):
+        logger.info("create user validation failed duplicate_username admin_id=%s username=%s", admin.id, payload.username)
+        raise HTTPException(status_code=409, detail="Пользователь с таким логином уже существует")
     expires_at = payload.expires_at
     profile = db.get(AccessProfile, payload.access_profile_id) if payload.access_profile_id else None
     if not expires_at and profile and profile.expires_in_days:
@@ -534,11 +549,22 @@ async def create_user(payload: VpnUserCreate, admin: Admin = Depends(require_wri
         traffic_limit_bytes=payload.traffic_limit_bytes or (profile.traffic_limit_bytes if profile else None),
     )
     db.add(user)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        logger.exception("create user flush failed admin_id=%s username=%s", admin.id, payload.username)
+        raise HTTPException(status_code=409, detail="Пользователь с таким логином уже существует") from exc
+    logger.info("create user db flushed admin_id=%s user_id=%s username=%s", admin.id, user.id, user.username)
     _, new_ids = set_user_node_access(db, user, allowed_node_ids, payload.primary_node_id)
     audit(db, "create", "vpn_user", user.id, admin.id)
     summary = await safe_auto_apply_after_change(db, admin, new_ids, "auto_apply_after_user_create")
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        logger.exception("create user commit failed admin_id=%s user_id=%s username=%s", admin.id, user.id, payload.username)
+        raise HTTPException(status_code=409, detail="Пользователь с таким логином уже существует") from exc
     if summary.ok:
         logger.info(
             "create user response success admin_id=%s user_id=%s username=%s apply_attempted=%s apply_skipped=%s",
@@ -571,6 +597,9 @@ def get_user(user_id: int, _: Admin = Depends(current_admin), db: Session = Depe
 @router.put("/users/{user_id}", response_model=VpnUserRead)
 async def update_user(user_id: int, payload: VpnUserCreate, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> VpnUser:
     user = _get_or_404(db, VpnUser, user_id)
+    duplicate_id = db.scalar(select(VpnUser.id).where(VpnUser.username == payload.username, VpnUser.id != user.id))
+    if duplicate_id:
+        raise HTTPException(status_code=409, detail="Пользователь с таким логином уже существует")
     active_devices = user.active_devices_count
     if payload.device_limit < active_devices:
         raise HTTPException(status_code=400, detail="Нельзя установить лимит меньше текущего количества активных устройств.")
@@ -584,7 +613,12 @@ async def update_user(user_id: int, payload: VpnUserCreate, admin: Admin = Depen
     old_ids, new_ids = set_user_node_access(db, user, allowed_node_ids, payload.primary_node_id)
     audit(db, "update", "vpn_user", user.id, admin.id)
     summary = await safe_auto_apply_after_change(db, admin, old_ids | new_ids, "auto_apply_after_user_update")
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        logger.exception("update user commit failed admin_id=%s user_id=%s username=%s", admin.id, user_id, payload.username)
+        raise HTTPException(status_code=409, detail="Пользователь с таким логином уже существует") from exc
     return attach_apply_status(user, summary)
 
 
