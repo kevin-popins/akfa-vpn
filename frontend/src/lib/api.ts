@@ -270,6 +270,14 @@ export type PublicConnect = {
   active_devices_count: number;
   devices_label: string;
   devices: VpnUserDevice[];
+  help_links: PublicHelpLinks;
+};
+
+export type PublicHelpLinks = {
+  android_happ_url?: string | null;
+  iphone_happ_url?: string | null;
+  windows_fclashx_url?: string | null;
+  macos_fclashx_url?: string | null;
 };
 
 export type TrafficCollectResult = {
@@ -380,6 +388,12 @@ export const api = {
   },
   dashboard() {
     return request<DashboardStats>("/admin/dashboard");
+  },
+  publicHelpLinks() {
+    return request<PublicHelpLinks>("/admin/settings/public-help-links");
+  },
+  savePublicHelpLinks(payload: PublicHelpLinks) {
+    return request<PublicHelpLinks>("/admin/settings/public-help-links", { method: "PUT", body: JSON.stringify(payload) });
   },
   nodes() {
     return request<NodeRead[]>("/admin/nodes");

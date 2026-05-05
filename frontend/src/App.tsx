@@ -27,7 +27,7 @@ import { Button } from "./components/ui/button";
 import { Card, CardContent, CardHeader } from "./components/ui/card";
 import { Field, Input, Select, Textarea } from "./components/ui/input";
 import { StatusBadge, Table } from "./components/ui/table";
-import { api, type AccessProfile, type ConfigApplySummary, type DashboardStats, type Department, type NodeMetric, type NodeRead, type PublicConnect, type SniCheckResult, type SshCheckResult, type SubscriptionVlessUri, type TrafficUser, type VpnUser, type VpnUserDevice, type XrayProbeResult } from "./lib/api";
+import { api, type AccessProfile, type ConfigApplySummary, type DashboardStats, type Department, type NodeMetric, type NodeRead, type PublicConnect, type PublicHelpLinks, type SniCheckResult, type SshCheckResult, type SubscriptionVlessUri, type TrafficUser, type VpnUser, type VpnUserDevice, type XrayProbeResult } from "./lib/api";
 import { formatBytes } from "./lib/utils";
 
 type SessionState = "checking" | "login" | "totp" | "setup" | "ready";
@@ -96,6 +96,13 @@ const defaultUserForm = {
   status: "active",
   allowed_node_ids: [] as number[],
   primary_node_id: ""
+};
+
+const defaultPublicHelpLinks: PublicHelpLinks = {
+  android_happ_url: "",
+  iphone_happ_url: "",
+  windows_fclashx_url: "",
+  macos_fclashx_url: ""
 };
 
 function App() {
@@ -180,6 +187,7 @@ function PublicConnectPage({ userToken }: { userToken: string }) {
   const options = connectOptions(userToken);
   const current = options.find((item) => item.id === selected) || options[0];
   const limitReached = data ? data.active_devices_count >= data.device_limit : false;
+  const currentHelpUrl = data?.help_links?.[current.helpKey] || "";
 
   async function copyLink(value: string) {
     await navigator.clipboard.writeText(value);
@@ -230,6 +238,19 @@ function PublicConnectPage({ userToken }: { userToken: string }) {
         {notice ? <Message tone={notice.includes("скопирована") ? "success" : "error"} text={notice} /> : null}
         {loading ? <Message tone="success" text="Загрузка подключения..." /> : null}
         {limitReached ? <Message tone="warning" text="Лимит устройств исчерпан. Новое устройство не сможет получить конфиг." /> : null}
+        {currentHelpUrl ? (
+          <section className="rounded-md border border-akfa-red/30 bg-red-50 px-4 py-3">
+            <div className="font-semibold">Не знаете как подключить?</div>
+            <a
+              className="mt-1 inline-flex font-semibold text-akfa-red underline-offset-4 hover:underline"
+              href={currentHelpUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Инструкция для {current.title} →
+            </a>
+          </section>
+        ) : null}
         <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           {options.map((option) => (
             <button
@@ -3195,12 +3216,24 @@ function AuditPage({ rows, onRefresh }: { rows: Array<Record<string, unknown>>; 
 function SettingsPage() {
   const [admin, setAdmin] = useState<{ email: string; role: string; totp_enabled: boolean } | null>(null);
   const [setup, setSetup] = useState<{ secret: string; otpauth_url: string } | null>(null);
+  const [helpLinks, setHelpLinks] = useState<PublicHelpLinks>(defaultPublicHelpLinks);
+  const [savingHelpLinks, setSavingHelpLinks] = useState(false);
   const [code, setCode] = useState("");
   const [password, setPassword] = useState("");
   const [message, setMessage] = useState("");
 
   useEffect(() => {
-    api.me().then(setAdmin).catch((error) => setMessage(error instanceof Error ? error.message : "Настройки недоступны"));
+    Promise.all([api.me(), api.publicHelpLinks()])
+      .then(([adminResponse, linksResponse]) => {
+        setAdmin(adminResponse);
+        setHelpLinks({
+          android_happ_url: linksResponse.android_happ_url || "",
+          iphone_happ_url: linksResponse.iphone_happ_url || "",
+          windows_fclashx_url: linksResponse.windows_fclashx_url || "",
+          macos_fclashx_url: linksResponse.macos_fclashx_url || ""
+        });
+      })
+      .catch((error) => setMessage(error instanceof Error ? error.message : "Настройки недоступны"));
   }, []);
 
   async function startSetup() {
@@ -3236,6 +3269,28 @@ function SettingsPage() {
       setMessage("Двухфакторная защита отключена");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "2FA не отключена");
+    }
+  }
+
+  function updateHelpLink(key: keyof PublicHelpLinks, value: string) {
+    setHelpLinks((current) => ({ ...current, [key]: value }));
+  }
+
+  async function saveHelpLinks() {
+    setSavingHelpLinks(true);
+    try {
+      const saved = await api.savePublicHelpLinks(helpLinks);
+      setHelpLinks({
+        android_happ_url: saved.android_happ_url || "",
+        iphone_happ_url: saved.iphone_happ_url || "",
+        windows_fclashx_url: saved.windows_fclashx_url || "",
+        macos_fclashx_url: saved.macos_fclashx_url || ""
+      });
+      setMessage("Ссылки на инструкции сохранены");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Ссылки не сохранены");
+    } finally {
+      setSavingHelpLinks(false);
     }
   }
 
@@ -3280,6 +3335,52 @@ function SettingsPage() {
             )}
           </div>
           {setup ? <div className="grid place-items-center rounded-md border border-akfa-line p-4"><QRCodeCanvas value={setup.otpauth_url} size={180} /></div> : null}
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader>
+          <h2 className="font-semibold">Инструкции для пользователей</h2>
+          <p className="mt-1 text-sm text-akfa-muted">Эти ссылки показываются на публичной странице подключения после выбора платформы.</p>
+        </CardHeader>
+        <CardContent className="grid gap-3">
+          <Field label="Android / Happ">
+            <Input
+              value={helpLinks.android_happ_url || ""}
+              onChange={(event) => updateHelpLink("android_happ_url", event.target.value)}
+              placeholder="https://example.com/android-happ"
+              type="url"
+            />
+          </Field>
+          <Field label="iPhone / iPad / Happ">
+            <Input
+              value={helpLinks.iphone_happ_url || ""}
+              onChange={(event) => updateHelpLink("iphone_happ_url", event.target.value)}
+              placeholder="https://example.com/iphone-happ"
+              type="url"
+            />
+          </Field>
+          <Field label="Windows / FClashX">
+            <Input
+              value={helpLinks.windows_fclashx_url || ""}
+              onChange={(event) => updateHelpLink("windows_fclashx_url", event.target.value)}
+              placeholder="https://example.com/windows-fclashx"
+              type="url"
+            />
+          </Field>
+          <Field label="macOS / FClashX">
+            <Input
+              value={helpLinks.macos_fclashx_url || ""}
+              onChange={(event) => updateHelpLink("macos_fclashx_url", event.target.value)}
+              placeholder="https://example.com/macos-fclashx"
+              type="url"
+            />
+          </Field>
+          <div>
+            <Button onClick={saveHelpLinks} disabled={savingHelpLinks}>
+              <Save size={16} />
+              {savingHelpLinks ? "Сохраняем..." : "Сохранить"}
+            </Button>
+          </div>
         </CardContent>
       </Card>
     </div>
@@ -3886,6 +3987,7 @@ function connectOptions(token: string) {
       id: "android-happ",
       title: "Android",
       client: "Happ",
+      helpKey: "android_happ_url" as const,
       path: `/sub/${token}?platform=android&client=happ&format=raw`,
       steps: ["Установите Happ.", "Добавьте подписку по ссылке или QR-коду.", "Обновите профиль и подключитесь."]
     },
@@ -3893,6 +3995,7 @@ function connectOptions(token: string) {
       id: "iphone-happ",
       title: "iPhone / iPad",
       client: "Happ",
+      helpKey: "iphone_happ_url" as const,
       path: `/sub/${token}?platform=iphone&client=happ&format=raw`,
       steps: ["Установите Happ.", "Добавьте подписку по ссылке или QR-коду.", "Разрешите VPN-профиль в iOS."]
     },
@@ -3900,6 +4003,7 @@ function connectOptions(token: string) {
       id: "windows-fclashx",
       title: "Windows",
       client: "FClashX / Mihomo",
+      helpKey: "windows_fclashx_url" as const,
       path: `/sub/${token}?platform=windows&client=fclashx&format=clash`,
       steps: ["Установите FClashX или Mihomo.", "Импортируйте ссылку подписки.", "Выберите профиль akfa vpn и подключитесь."]
     },
@@ -3907,6 +4011,7 @@ function connectOptions(token: string) {
       id: "macos-fclashx",
       title: "macOS",
       client: "FClashX / Clash",
+      helpKey: "macos_fclashx_url" as const,
       path: `/sub/${token}?platform=macos&client=fclashx&format=clash`,
       steps: ["Установите FClashX или Clash.", "Импортируйте ссылку YAML-подписки.", "Выберите профиль akfa vpn."]
     }

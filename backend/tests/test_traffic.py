@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from app.models import UserNodeTraffic, VpnUser, VpsNode
+from app.models import DeviceStatus, UserNodeTraffic, VpnUser, VpnUserDevice, VpsNode
 from app.services.traffic import apply_xray_stats, enforce_expiration_and_limits, parse_xray_stats, traffic_overview
 
 
@@ -212,3 +212,34 @@ def test_online_status_becomes_offline_after_timeout(db_session):
     db_session.add(user)
     db_session.commit()
     assert user.online_status == "offline"
+
+
+def test_traffic_overview_last_online_uses_latest_active_device_seen_at(db_session):
+    old_user_online = datetime.now(timezone.utc) - timedelta(days=1)
+    fresh_device_seen = datetime.now(timezone.utc)
+    user = VpnUser(
+        first_name="Fresh",
+        last_name="Device",
+        username="fresh-device",
+        uuid="00000000-0000-0000-0000-000000000010",
+        subscription_token="fresh-device-token",
+        last_online_at=old_user_online,
+    )
+    db_session.add(user)
+    db_session.flush()
+    db_session.add(
+        VpnUserDevice(
+            vpn_user_id=user.id,
+            uuid="10000000-0000-4000-8000-000000000010",
+            subscription_token="fresh-device-sub-token",
+            status=DeviceStatus.active.value,
+            hwid_hash="fresh-hwid-hash",
+            last_seen_at=fresh_device_seen,
+            last_subscribed_at=fresh_device_seen,
+        )
+    )
+    db_session.commit()
+
+    row = traffic_overview(db_session)[0]
+    assert row["online_status"] == "online"
+    assert row["last_online_at"] == fresh_device_seen

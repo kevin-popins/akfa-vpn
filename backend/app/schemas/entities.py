@@ -1,4 +1,5 @@
 from datetime import datetime
+from urllib.parse import urlparse
 
 import re
 
@@ -275,6 +276,26 @@ class VpnUserDeviceUpdate(BaseModel):
     status: str | None = None
 
 
+class PublicHelpLinks(BaseModel):
+    android_happ_url: str | None = None
+    iphone_happ_url: str | None = None
+    windows_fclashx_url: str | None = None
+    macos_fclashx_url: str | None = None
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def validate_public_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        if not normalized:
+            return None
+        parsed = urlparse(normalized)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("Укажите корректный URL или оставьте поле пустым")
+        return normalized
+
+
 class PublicConnectRead(BaseModel):
     display_name: str
     status: str
@@ -285,6 +306,7 @@ class PublicConnectRead(BaseModel):
     active_devices_count: int
     devices_label: str
     devices: list[VpnUserDeviceRead] = Field(default_factory=list)
+    help_links: PublicHelpLinks = Field(default_factory=PublicHelpLinks)
 
 
 class BulkImportResult(BaseModel):

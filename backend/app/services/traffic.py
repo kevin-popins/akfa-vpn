@@ -474,7 +474,11 @@ def traffic_user_state(user: VpnUser) -> dict[str, Any]:
 def traffic_overview(db: Session) -> list[dict]:
     snapshots = {
         snapshot.vpn_user_id: snapshot
-        for snapshot in db.scalars(select(TrafficSnapshot).order_by(TrafficSnapshot.collected_at)).all()
+        for snapshot in db.scalars(
+            select(TrafficSnapshot)
+            .where(TrafficSnapshot.vpn_user_id.is_not(None))
+            .order_by(TrafficSnapshot.collected_at)
+        ).all()
     }
     rows = []
     for user in db.scalars(
@@ -483,6 +487,7 @@ def traffic_overview(db: Session) -> list[dict]:
         .order_by(VpnUser.created_at.desc())
     ):
         snapshot = snapshots.get(user.id)
+        last_online_at = latest_user_online_at(user)
         rows.append(
             {
                 "id": user.id,
@@ -491,12 +496,12 @@ def traffic_overview(db: Session) -> list[dict]:
                 "last_name": user.last_name,
                 "status": user.status,
                 "access_status": user.access_status,
-                "online_status": user.online_status,
+                "online_status": "online" if is_recent_online(last_online_at) else "offline",
                 "upload_bytes": user.used_upload_bytes or 0,
                 "download_bytes": user.used_download_bytes or 0,
                 "total_bytes": user.used_total_bytes or 0,
                 "last_seen_delta_bytes": user.last_seen_delta_bytes or 0,
-                "last_online_at": user.last_online_at,
+                "last_online_at": last_online_at,
                 "last_traffic_collected_at": user.last_traffic_collected_at,
                 "traffic_limit_bytes": user.traffic_limit_bytes,
                 "devices_label": user.devices_label,
@@ -506,6 +511,30 @@ def traffic_overview(db: Session) -> list[dict]:
             }
         )
     return rows
+
+
+def latest_user_online_at(user: VpnUser) -> datetime | None:
+    values: list[datetime] = []
+    append_datetime(values, user.last_online_at)
+    for device in user.devices:
+        if device.status != DeviceStatus.active.value:
+            continue
+        append_datetime(values, device.last_seen_at)
+        append_datetime(values, device.last_subscribed_at)
+    return max(values) if values else None
+
+
+def append_datetime(values: list[datetime], value: datetime | None) -> None:
+    if not value:
+        return
+    values.append(value if value.tzinfo else value.replace(tzinfo=timezone.utc))
+
+
+def is_recent_online(value: datetime | None) -> bool:
+    if not value:
+        return False
+    normalized = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - normalized).total_seconds() <= ONLINE_WINDOW_SECONDS
 
 
 def enforce_expiration_and_limits(db: Session) -> int:

@@ -20,6 +20,7 @@ from app.db.session import get_db
 from app.models import (
     AccessProfile,
     Admin,
+    AppSetting,
     AuditLog,
     Department,
     NodeStatus,
@@ -55,6 +56,7 @@ from app.schemas.entities import (
     SshCheckResponse,
     TrafficSnapshotRead,
     TrafficUserRead,
+    PublicHelpLinks,
     PublicConnectRead,
     VpnUserDeviceRead,
     VpnUserDeviceUpdate,
@@ -97,6 +99,12 @@ logger = logging.getLogger(__name__)
 IDEMPOTENCY_TTL_SECONDS = 300
 _create_user_idempotency_cache: dict[str, dict[str, Any]] = {}
 _create_user_idempotency_locks: dict[str, asyncio.Lock] = {}
+PUBLIC_HELP_LINK_KEYS = (
+    "android_happ_url",
+    "iphone_happ_url",
+    "windows_fclashx_url",
+    "macos_fclashx_url",
+)
 
 
 def _get_or_404(db: Session, model: type[ModelT], item_id: int) -> ModelT:
@@ -404,6 +412,26 @@ def cache_created_user(key: str | None, user: VpnUser, summary: ConfigApplySumma
     }
 
 
+def read_public_help_links(db: Session) -> PublicHelpLinks:
+    rows = db.scalars(select(AppSetting).where(AppSetting.key.in_(PUBLIC_HELP_LINK_KEYS))).all()
+    values = {row.key: row.value for row in rows}
+    return PublicHelpLinks(**{key: values.get(key) for key in PUBLIC_HELP_LINK_KEYS})
+
+
+def save_public_help_links(db: Session, payload: PublicHelpLinks) -> PublicHelpLinks:
+    values = payload.model_dump()
+    existing = {row.key: row for row in db.scalars(select(AppSetting).where(AppSetting.key.in_(PUBLIC_HELP_LINK_KEYS))).all()}
+    for key in PUBLIC_HELP_LINK_KEYS:
+        row = existing.get(key)
+        value = values.get(key)
+        if row:
+            row.value = value
+        else:
+            db.add(AppSetting(key=key, value=value))
+    db.flush()
+    return read_public_help_links(db)
+
+
 @router.get("/dashboard", response_model=DashboardStats)
 def dashboard(_: Admin = Depends(current_admin), db: Session = Depends(get_db)) -> DashboardStats:
     visible_users = VpnUser.status != UserStatus.deleted.value
@@ -414,6 +442,23 @@ def dashboard(_: Admin = Depends(current_admin), db: Session = Depends(get_db)) 
         users_active=db.scalar(select(func.count(VpnUser.id)).where(VpnUser.status == UserStatus.active.value)) or 0,
         traffic_total_bytes=db.scalar(select(func.coalesce(func.sum(VpnUser.used_total_bytes), 0)).where(visible_users)) or 0,
     )
+
+
+@router.get("/settings/public-help-links", response_model=PublicHelpLinks)
+def get_public_help_links(_: Admin = Depends(current_admin), db: Session = Depends(get_db)) -> PublicHelpLinks:
+    return read_public_help_links(db)
+
+
+@router.put("/settings/public-help-links", response_model=PublicHelpLinks)
+def update_public_help_links(
+    payload: PublicHelpLinks,
+    admin: Admin = Depends(require_write),
+    db: Session = Depends(get_db),
+) -> PublicHelpLinks:
+    links = save_public_help_links(db, payload)
+    audit(db, "update", "public_help_links", admin_id=admin.id)
+    db.commit()
+    return links
 
 
 @router.get("/access-profiles", response_model=list[AccessProfileRead])
@@ -1448,6 +1493,7 @@ def public_connect(user_token: str, db: Session = Depends(get_db)) -> PublicConn
         active_devices_count=user.active_devices_count,
         devices_label=user.devices_label,
         devices=devices,
+        help_links=read_public_help_links(db),
     )
 
 

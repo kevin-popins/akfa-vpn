@@ -92,6 +92,62 @@ def test_seed_default_profiles_creates_full_vpn_and_ru_direct(client, auth_heade
     assert profiles["Российские сервисы напрямую"]["blocked_domains"] == []
 
 
+def test_admin_can_save_and_read_public_help_links(client, auth_headers):
+    payload = {
+        "android_happ_url": "https://example.com/android",
+        "iphone_happ_url": "https://example.com/iphone",
+        "windows_fclashx_url": "https://example.com/windows",
+        "macos_fclashx_url": "",
+    }
+    saved = client.put("/admin/settings/public-help-links", headers=auth_headers, json=payload)
+    assert saved.status_code == 200
+    assert saved.json()["android_happ_url"] == "https://example.com/android"
+    assert saved.json()["macos_fclashx_url"] is None
+
+    fetched = client.get("/admin/settings/public-help-links", headers=auth_headers)
+    assert fetched.status_code == 200
+    assert fetched.json()["windows_fclashx_url"] == "https://example.com/windows"
+
+
+def test_public_connect_response_includes_help_links(client, auth_headers):
+    saved = client.put(
+        "/admin/settings/public-help-links",
+        headers=auth_headers,
+        json={
+            "android_happ_url": "https://help.example/android",
+            "iphone_happ_url": None,
+            "windows_fclashx_url": "https://help.example/windows",
+            "macos_fclashx_url": "https://help.example/macos",
+        },
+    )
+    assert saved.status_code == 200
+    user = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={"first_name": "Help", "last_name": "Links", "username": "help-links-user"},
+    )
+    assert user.status_code == 200
+
+    response = client.get(f"/public/connect/{user.json()['subscription_token']}")
+    assert response.status_code == 200
+    assert response.json()["help_links"]["android_happ_url"] == "https://help.example/android"
+    assert response.json()["help_links"]["windows_fclashx_url"] == "https://help.example/windows"
+
+
+def test_public_help_links_reject_invalid_urls(client, auth_headers):
+    response = client.put(
+        "/admin/settings/public-help-links",
+        headers=auth_headers,
+        json={
+            "android_happ_url": "not-a-url",
+            "iphone_happ_url": "",
+            "windows_fclashx_url": "",
+            "macos_fclashx_url": "",
+        },
+    )
+    assert response.status_code == 422
+
+
 def test_access_profile_blocked_domains_are_normalized(client, auth_headers):
     response = client.post(
         "/admin/access-profiles",
