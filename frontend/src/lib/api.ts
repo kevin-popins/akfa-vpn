@@ -54,6 +54,17 @@ export type NodeActionJob = {
   updated_at: string;
 };
 
+export type NodeBulkActionResult = {
+  ok: boolean;
+  message: string;
+  users_changed: number;
+  profiles_changed: number;
+  affected_node_ids: number[];
+  apply_status?: ConfigApplySummary | null;
+  apply_error?: string | null;
+  errors?: string[];
+};
+
 export type NodeApplyResult = {
   node_id: number;
   node_name: string;
@@ -88,7 +99,7 @@ export type NodeMetric = {
   traffic_upload_bytes: number;
   traffic_download_bytes: number;
   traffic_total_bytes: number;
-  traffic_source: "xray_inbound" | "users_sum_fallback";
+  traffic_source: "xray_inbound" | "node_traffic";
   last_checked_at?: string | null;
   errors: string[];
 };
@@ -373,8 +384,8 @@ export const api = {
   nodes() {
     return request<NodeRead[]>("/admin/nodes");
   },
-  nodeMetrics() {
-    return request<NodeMetric[]>("/admin/nodes/metrics");
+  nodeMetrics(period = "all") {
+    return request<NodeMetric[]>(`/admin/nodes/metrics?period=${encodeURIComponent(period)}`);
   },
   createNode(payload: Record<string, unknown>) {
     return request<NodeRead>("/admin/nodes", { method: "POST", body: JSON.stringify(payload) });
@@ -412,8 +423,26 @@ export const api = {
   checkSni(sni: string) {
     return request<SniCheckResult>("/admin/tools/check-sni", { method: "POST", body: JSON.stringify({ sni }) });
   },
-  deleteNode(id: number) {
-    return request<{ message: string }>(`/admin/nodes/${id}`, { method: "DELETE" });
+  nodeLifecycle(id: number, action: "disable" | "enable" | "maintenance") {
+    return request<NodeBulkActionResult>(`/admin/nodes/${id}/${action}`, { method: "POST" });
+  },
+  addNodeToProfile(id: number, profile_id: number) {
+    return request<NodeBulkActionResult>(`/admin/nodes/${id}/profiles/add`, { method: "POST", body: JSON.stringify({ profile_id }) });
+  },
+  removeNodeFromProfile(id: number, profile_id: number) {
+    return request<NodeBulkActionResult>(`/admin/nodes/${id}/profiles/remove`, { method: "POST", body: JSON.stringify({ profile_id }) });
+  },
+  addNodeToUsers(id: number, payload: Record<string, unknown>) {
+    return request<NodeBulkActionResult>(`/admin/nodes/${id}/users/add`, { method: "POST", body: JSON.stringify(payload) });
+  },
+  removeNodeFromUsers(id: number, payload: Record<string, unknown>) {
+    return request<NodeBulkActionResult>(`/admin/nodes/${id}/users/remove`, { method: "POST", body: JSON.stringify(payload) });
+  },
+  replaceNode(id: number, new_node_id: number) {
+    return request<NodeBulkActionResult>(`/admin/nodes/${id}/replace`, { method: "POST", body: JSON.stringify({ new_node_id }) });
+  },
+  deleteNode(id: number, force = false) {
+    return request<NodeBulkActionResult>(`/admin/nodes/${id}${force ? "?force=true" : ""}`, { method: "DELETE" });
   },
   departments() {
     return request<Department[]>("/admin/departments");

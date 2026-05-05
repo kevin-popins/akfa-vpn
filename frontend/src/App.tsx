@@ -410,6 +410,7 @@ function AdminPages({
   const [dashboard, setDashboard] = useState<DashboardStats | null>(null);
   const [nodes, setNodes] = useState<NodeRead[]>([]);
   const [nodeMetrics, setNodeMetrics] = useState<NodeMetric[]>([]);
+  const [dashboardTrafficPeriod, setDashboardTrafficPeriod] = useState("all");
   const [users, setUsers] = useState<VpnUser[]>([]);
   const [trafficRows, setTrafficRows] = useState<TrafficUser[]>([]);
   const [departments, setDepartments] = useState<Department[]>([]);
@@ -449,7 +450,7 @@ function AdminPages({
       const [stats, nodeList, metricList, userList, departmentList, profileList, auditList, trafficList] = await Promise.all([
         api.dashboard(),
         api.nodes(),
-        api.nodeMetrics(),
+        api.nodeMetrics(dashboardTrafficPeriod),
         api.users(),
         api.departments(),
         api.profiles(),
@@ -470,7 +471,7 @@ function AdminPages({
     } catch (error) {
       onNotice(error instanceof Error ? error.message : "API недоступен");
     }
-  }, [onNotice]);
+  }, [onNotice, dashboardTrafficPeriod]);
 
   useEffect(() => {
     void refresh();
@@ -478,7 +479,7 @@ function AdminPages({
 
   const refreshVisibleData = useCallback(async (targetPage: PageKey) => {
     if (targetPage === "dashboard") {
-      const [stats, metricList, userList] = await Promise.all([api.dashboard(), api.nodeMetrics(), api.users()]);
+      const [stats, metricList, userList] = await Promise.all([api.dashboard(), api.nodeMetrics(dashboardTrafficPeriod), api.users()]);
       const visible = visibleUsers(userList);
       setDashboard(stats);
       setNodeMetrics(metricList);
@@ -497,12 +498,12 @@ function AdminPages({
       return;
     }
     if (targetPage === "servers" || targetPage === "server-detail" || targetPage === "install-xray") {
-      const [nodeList, metricList] = await Promise.all([api.nodes(), api.nodeMetrics()]);
+      const [nodeList, metricList] = await Promise.all([api.nodes(), api.nodeMetrics(dashboardTrafficPeriod)]);
       setNodes(nodeList);
       setNodeMetrics(metricList);
       setSelectedNode((current) => nodeList.find((node) => node.id === current?.id) || current);
     }
-  }, []);
+  }, [dashboardTrafficPeriod]);
 
   useEffect(() => {
     let stopped = false;
@@ -706,25 +707,46 @@ function AdminPages({
   async function deleteServer(node: NodeRead) {
     setConfirm({
       title: "Удалить сервер из AKFA?",
-      text: `${node.name}. Будет удалена только запись в AKFA. Xray и файлы на VPS не удаляются.`,
+      text: `${node.name}. Обычное удаление доступно только если сервер не используется пользователями и профилями.`,
       onConfirm: async () => {
         setConfirm(null);
         try {
+          setOperation({ title: "Удаление сервера", message: "Проверяем связи сервера...", tone: "pending" });
           const result = await api.deleteNode(node.id);
           setNodes(nodes.filter((item) => item.id !== node.id));
           setSelectedNode((current) => (current?.id === node.id ? null : current));
-          onNotice(result.message || "Сервер удален из AKFA");
-          await refresh();
+          setOperation({ title: "Удаление сервера", message: result.message || "Сервер удален из AKFA", tone: applyStatusHasProblems(result.apply_status) ? "warning" : "success" });
+          await refresh().catch((error) => {
+            const message = error instanceof Error ? error.message : "список не обновился";
+            setOperation({ title: "Сервер удалён", message: `${result.message}. Обновите список вручную: ${message}`, tone: "warning" });
+          });
           setPage("servers");
         } catch (error) {
-          onNotice(error instanceof Error ? error.message : "Сервер не удален");
+          setOperation({ title: "Сервер не удалён", message: error instanceof Error ? error.message : "Сервер не удален", tone: "error" });
         }
       }
     });
   }
 
+  async function runNodeManagement(title: string, startMessage: string, action: () => Promise<{ message: string; apply_status?: ConfigApplySummary | null; apply_error?: string | null }>) {
+    try {
+      setOperation({ title, message: startMessage, tone: "pending" });
+      const applyTimer = window.setTimeout(() => setOperation({ title, message: "Применяем конфигурации...", tone: "pending" }), 250);
+      const result = await action();
+      window.clearTimeout(applyTimer);
+      const message = result.apply_error ? `${result.message}: ${result.apply_error}` : result.message;
+      setOperation({ title, message, tone: result.apply_error || applyStatusHasProblems(result.apply_status) ? "warning" : "success" });
+      await refresh().catch((error) => {
+        const refreshMessage = error instanceof Error ? error.message : "список не обновился";
+        setOperation({ title, message: `${message}. Обновите список вручную: ${refreshMessage}`, tone: "warning" });
+      });
+    } catch (error) {
+      setOperation({ title, message: error instanceof Error ? error.message : "Действие не выполнено", tone: "error" });
+    }
+  }
+
   const pages = {
-    dashboard: <DashboardPage stats={dashboard} nodeMetrics={nodeMetrics} users={users} setPage={setPage} onRefresh={() => refreshVisibleData("dashboard")} />,
+    dashboard: <DashboardPage stats={dashboard} nodeMetrics={nodeMetrics} users={users} setPage={setPage} onRefresh={() => refreshVisibleData("dashboard")} trafficPeriod={dashboardTrafficPeriod} onTrafficPeriodChange={setDashboardTrafficPeriod} />,
     servers: (
       <ServersPage
         nodes={nodes}
@@ -761,6 +783,34 @@ function AdminPages({
         }}
         onNotice={noticeWithApplyStatus}
         onDelete={selectedNode ? () => deleteServer(selectedNode) : undefined}
+        nodes={nodes}
+        profiles={profiles}
+        departments={departments}
+        onLifecycle={(action) => selectedNode ? runNodeManagement(
+          action === "enable" ? "Включение сервера" : action === "maintenance" ? "Обслуживание сервера" : "Отключение сервера",
+          "Обновляем статус сервера...",
+          () => api.nodeLifecycle(selectedNode.id, action)
+        ) : undefined}
+        onProfileAction={(mode, profileId) => selectedNode ? runNodeManagement(
+          mode === "add" ? "Добавление сервера в профиль" : "Удаление сервера из профиля",
+          "Обновляем профиль доступа...",
+          () => mode === "add" ? api.addNodeToProfile(selectedNode.id, profileId) : api.removeNodeFromProfile(selectedNode.id, profileId)
+        ) : undefined}
+        onBulkUsers={(mode, payload) => selectedNode ? runNodeManagement(
+          mode === "add" ? "Массовое добавление сервера" : "Массовое удаление сервера",
+          "Ищем пользователей...",
+          () => mode === "add" ? api.addNodeToUsers(selectedNode.id, payload) : api.removeNodeFromUsers(selectedNode.id, payload)
+        ) : undefined}
+        onReplace={(newNodeId) => selectedNode ? runNodeManagement(
+          "Замена сервера",
+          "Обновляем пользователей и профили...",
+          () => api.replaceNode(selectedNode.id, newNodeId)
+        ) : undefined}
+        onForceDelete={() => selectedNode ? runNodeManagement(
+          "Принудительное удаление сервера",
+          "Отключаем сервер у пользователей и профилей...",
+          () => api.deleteNode(selectedNode.id, true)
+        ).then(() => setPage("servers")) : undefined}
       />
     ),
     "install-xray": (
@@ -878,13 +928,17 @@ function DashboardPage({
   nodeMetrics,
   users,
   setPage,
-  onRefresh
+  onRefresh,
+  trafficPeriod,
+  onTrafficPeriodChange
 }: {
   stats: DashboardStats | null;
   nodeMetrics: NodeMetric[];
   users: VpnUser[];
   setPage: (page: PageKey) => void;
   onRefresh: () => Promise<void>;
+  trafficPeriod: string;
+  onTrafficPeriodChange: (value: string) => void;
 }) {
   const visibleUserRows = visibleUsers(users).filter((user) => user.status === "active");
   const tiles = [
@@ -912,7 +966,13 @@ function DashboardPage({
       <Card>
         <CardHeader className="flex flex-row items-center justify-between">
           <h2 className="font-semibold">Данные по серверам</h2>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
+            <Select className="w-40" value={trafficPeriod} onChange={(event) => onTrafficPeriodChange(event.target.value)}>
+              <option value="today">Сегодня</option>
+              <option value="7d">7 дней</option>
+              <option value="month">Этот месяц</option>
+              <option value="all">Всё время</option>
+            </Select>
             <Button variant="secondary" onClick={onRefresh}><RefreshCcw size={16} />Обновить</Button>
             <Button variant="secondary" onClick={() => setPage("servers")}>Серверы</Button>
           </div>
@@ -984,7 +1044,7 @@ function ServerMetricRow({ metric }: { metric: NodeMetric }) {
         <div><span className="text-akfa-muted">Upload</span><div className="font-medium">{formatBytes(metric.traffic_upload_bytes)}</div></div>
         <div><span className="text-akfa-muted">Download</span><div className="font-medium">{formatBytes(metric.traffic_download_bytes)}</div></div>
         <div><span className="text-akfa-muted">Total</span><div className="font-medium">{formatBytes(metric.traffic_total_bytes)}</div></div>
-        <div><span className="text-akfa-muted">Источник</span><div className="font-medium">{metric.traffic_source === "xray_inbound" ? "Xray inbound" : "Users sum"}</div></div>
+        <div><span className="text-akfa-muted">Источник</span><div className="font-medium">{metric.traffic_source === "xray_inbound" ? "Xray node stats" : "Node traffic"}</div></div>
       </div>
       {metric.errors.length ? <div className="mt-2 text-xs text-akfa-red">{metric.errors.join("; ")}</div> : null}
     </div>
@@ -1328,15 +1388,26 @@ function AddServerPage({
 
 function ServerDetailPage({
   node,
+  nodes,
+  profiles,
+  departments,
   onAction,
   pendingAction,
   onPreview,
   onBack,
   onUpdated,
   onNotice,
-  onDelete
+  onDelete,
+  onLifecycle,
+  onProfileAction,
+  onBulkUsers,
+  onReplace,
+  onForceDelete
 }: {
   node: NodeRead | null;
+  nodes: NodeRead[];
+  profiles: AccessProfile[];
+  departments: Department[];
   onAction: (action: NodeAction) => void;
   pendingAction?: { nodeId: number; action: NodeAction } | null;
   onPreview: () => void;
@@ -1344,10 +1415,20 @@ function ServerDetailPage({
   onUpdated: (node: NodeRead) => Promise<void>;
   onNotice: (value: string, applyStatus?: ConfigApplySummary | null) => void;
   onDelete?: () => void;
+  onLifecycle?: (action: "disable" | "enable" | "maintenance") => void;
+  onProfileAction?: (mode: "add" | "remove", profileId: number) => void;
+  onBulkUsers?: (mode: "add" | "remove", payload: Record<string, unknown>) => void;
+  onReplace?: (newNodeId: number) => void;
+  onForceDelete?: () => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [form, setForm] = useState<Record<string, string | number>>({});
   const [saving, setSaving] = useState(false);
+  const [profileActionId, setProfileActionId] = useState<number>(profiles[0]?.id || 0);
+  const [bulkScope, setBulkScope] = useState("all_active");
+  const [bulkDepartmentId, setBulkDepartmentId] = useState<number>(departments[0]?.id || 0);
+  const [bulkProfileId, setBulkProfileId] = useState<number>(profiles[0]?.id || 0);
+  const [replaceNodeId, setReplaceNodeId] = useState<number>(nodes.find((item) => item.id !== node?.id)?.id || 0);
 
   useEffect(() => {
     if (!node) return;
@@ -1364,10 +1445,31 @@ function ServerDetailPage({
     });
   }, [node]);
 
+  useEffect(() => {
+    if (!profileActionId && profiles[0]) setProfileActionId(profiles[0].id);
+    if (!bulkProfileId && profiles[0]) setBulkProfileId(profiles[0].id);
+  }, [profiles, profileActionId, bulkProfileId]);
+
+  useEffect(() => {
+    if (!bulkDepartmentId && departments[0]) setBulkDepartmentId(departments[0].id);
+  }, [departments, bulkDepartmentId]);
+
+  useEffect(() => {
+    const fallback = nodes.find((item) => item.id !== node?.id && item.status !== "deleted");
+    if (!replaceNodeId && fallback) setReplaceNodeId(fallback.id);
+  }, [nodes, node?.id, replaceNodeId]);
+
   if (!node) {
     return <EmptyPanel title="Сервер не выбран" text="Откройте список серверов и выберите VPS для просмотра деталей." />;
   }
   const nodeBusy = pendingAction?.nodeId === node.id;
+  const otherNodes = nodes.filter((item) => item.id !== node.id && item.status !== "deleted");
+  const bulkPayload = {
+    scope: bulkScope,
+    department_id: bulkScope === "department" ? bulkDepartmentId : null,
+    access_profile_id: bulkScope === "profile" ? bulkProfileId : null,
+    user_ids: []
+  };
 
   function update(key: string, value: string | number) {
     setForm((current) => ({ ...current, [key]: value }));
@@ -1431,7 +1533,67 @@ function ServerDetailPage({
           <Button disabled={nodeBusy} onClick={() => onAction(node.status === "online" ? "apply-config" : "install")}><Play size={16} />{nodeBusy ? "Выполняется..." : node.status === "online" ? "Применить конфиг" : "Установить Xray"}</Button>
           <Button variant="secondary" disabled={nodeBusy} onClick={() => setEditing((value) => !value)}><Save size={16} />Редактировать</Button>
           <Button variant="ghost" disabled={nodeBusy} onClick={onPreview}><FileJson size={16} />Предпросмотр конфига</Button>
+          {node.status === "disabled" || node.status === "maintenance" || node.status === "offline" || node.status === "failed" ? (
+            <Button variant="secondary" disabled={nodeBusy} onClick={() => onLifecycle?.("enable")}><CheckCircle2 size={16} />Включить сервер</Button>
+          ) : (
+            <Button variant="secondary" disabled={nodeBusy} onClick={() => onLifecycle?.("disable")}><XCircle size={16} />Отключить сервер</Button>
+          )}
+          <Button variant="secondary" disabled={nodeBusy} onClick={() => onLifecycle?.("maintenance")}><AlertTriangle size={16} />На обслуживание</Button>
           {onDelete ? <Button variant="danger" disabled={nodeBusy} onClick={onDelete}><Trash2 size={16} />Удалить сервер</Button> : null}
+        </CardContent>
+      </Card>
+      <Card className="lg:col-span-2">
+        <CardHeader><h2 className="font-semibold">Массовое управление доступом</h2></CardHeader>
+        <CardContent className="grid gap-4 lg:grid-cols-3">
+          <div className="grid gap-2 rounded-md border border-akfa-line p-3">
+            <h3 className="text-sm font-semibold">Профили доступа</h3>
+            <Select value={profileActionId || ""} onChange={(event) => setProfileActionId(Number(event.target.value))}>
+              {profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
+            </Select>
+            <div className="flex flex-wrap gap-2">
+              <Button variant="secondary" disabled={!profileActionId} onClick={() => onProfileAction?.("add", profileActionId)}>Добавить в профиль</Button>
+              <Button variant="secondary" disabled={!profileActionId} onClick={() => onProfileAction?.("remove", profileActionId)}>Убрать из профиля</Button>
+            </div>
+          </div>
+          <div className="grid gap-2 rounded-md border border-akfa-line p-3">
+            <h3 className="text-sm font-semibold">Пользователи</h3>
+            <Select value={bulkScope} onChange={(event) => setBulkScope(event.target.value)}>
+              <option value="all_active">Все активные</option>
+              <option value="department">По отделу</option>
+              <option value="profile">По профилю</option>
+            </Select>
+            {bulkScope === "department" ? (
+              <Select value={bulkDepartmentId || ""} onChange={(event) => setBulkDepartmentId(Number(event.target.value))}>
+                {departments.map((department) => <option key={department.id} value={department.id}>{department.name}</option>)}
+              </Select>
+            ) : null}
+            {bulkScope === "profile" ? (
+              <Select value={bulkProfileId || ""} onChange={(event) => setBulkProfileId(Number(event.target.value))}>
+                {profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
+              </Select>
+            ) : null}
+            <div className="flex flex-wrap gap-2">
+              <Button variant="secondary" onClick={() => onBulkUsers?.("add", bulkPayload)}>Добавить пользователям</Button>
+              <Button variant="secondary" onClick={() => onBulkUsers?.("remove", bulkPayload)}>Убрать у пользователей</Button>
+            </div>
+          </div>
+          <div className="grid gap-2 rounded-md border border-akfa-line p-3">
+            <h3 className="text-sm font-semibold">Замена и удаление</h3>
+            <Select value={replaceNodeId || ""} onChange={(event) => setReplaceNodeId(Number(event.target.value))}>
+              {otherNodes.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.ip_address}</option>)}
+            </Select>
+            <Button variant="secondary" disabled={!replaceNodeId} onClick={() => onReplace?.(replaceNodeId)}>Заменить этим сервером</Button>
+            <Button
+              variant="danger"
+              onClick={() => {
+                if (window.confirm("Принудительно удалить сервер и убрать его у всех пользователей/профилей?")) {
+                  onForceDelete?.();
+                }
+              }}
+            >
+              Принудительно удалить
+            </Button>
+          </div>
         </CardContent>
       </Card>
       {editing ? (
@@ -3649,7 +3811,8 @@ function translateStatus(value: string) {
     online: "онлайн",
     offline: "офлайн",
     installing: "установка",
-    failed: "ошибка"
+    failed: "ошибка",
+    maintenance: "обслуживание"
   };
   return map[value] || value;
 }

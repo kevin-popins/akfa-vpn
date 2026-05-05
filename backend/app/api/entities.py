@@ -42,8 +42,12 @@ from app.schemas.entities import (
     NodeCreate,
     NodeActionJobAccepted,
     NodeActionJobRead,
+    NodeBulkActionResult,
+    NodeBulkUserRequest,
     NodeMetricsRead,
+    NodeProfileActionRequest,
     NodeRead,
+    NodeReplaceRequest,
     NodeUpdate,
     RestoreSummary,
     SniCheckRequest,
@@ -124,9 +128,14 @@ def default_allowed_node_ids(db: Session) -> list[int]:
 
 def normalize_allowed_node_ids(db: Session, allowed_node_ids: list[int], status: str) -> list[int]:
     ids = sorted(set(allowed_node_ids or []))
-    if not ids and status == UserStatus.active.value:
-        ids = default_allowed_node_ids(db)
-    existing_ids = set(db.scalars(select(VpsNode.id).where(VpsNode.id.in_(ids))).all()) if ids else set()
+    existing_ids = set(
+        db.scalars(
+            select(VpsNode.id).where(
+                VpsNode.id.in_(ids),
+                VpsNode.status != NodeStatus.deleted.value,
+            )
+        ).all()
+    ) if ids else set()
     return [node_id for node_id in ids if node_id in existing_ids]
 
 
@@ -140,9 +149,154 @@ def set_user_node_access(db: Session, user: VpnUser, allowed_node_ids: list[int]
     user.node_links.clear()
     for node_id in sorted(new_ids):
         user.node_links.append(VpnUserNode(node_id=node_id))
-    user.primary_node_id = primary_node_id if primary_node_id in new_ids else (min(new_ids) if new_ids else None)
+    if new_ids:
+        user.primary_node_id = primary_node_id if primary_node_id in new_ids else min(new_ids)
+    else:
+        user.primary_node_id = primary_node_id
     db.flush()
     return old_ids, new_ids
+
+
+def profile_node_ids(profile: AccessProfile | None) -> set[int]:
+    return set((profile.allowed_nodes or []) if profile else [])
+
+
+def effective_user_node_ids_for_admin(user: VpnUser) -> set[int]:
+    explicit_ids = set(user.allowed_node_ids or [])
+    if explicit_ids:
+        return explicit_ids
+    return profile_node_ids(user.access_profile)
+
+
+def node_usage_counts(db: Session, node_id: int) -> dict[str, int]:
+    explicit_users = db.scalar(
+        select(func.count(VpnUserNode.vpn_user_id))
+        .join(VpnUser, VpnUser.id == VpnUserNode.vpn_user_id)
+        .where(VpnUserNode.node_id == node_id, VpnUser.status != UserStatus.deleted.value)
+    ) or 0
+    primary_users = db.scalar(
+        select(func.count(VpnUser.id)).where(
+            VpnUser.primary_node_id == node_id,
+            VpnUser.status != UserStatus.deleted.value,
+        )
+    ) or 0
+    profiles = 0
+    for profile in db.scalars(select(AccessProfile)):
+        if node_id in set(profile.allowed_nodes or []):
+            profiles += 1
+    return {"users": explicit_users, "primary_users": primary_users, "profiles": profiles}
+
+
+def node_in_use_message(counts: dict[str, int]) -> str:
+    parts: list[str] = []
+    if counts.get("users"):
+        parts.append(f"пользователи: {counts['users']}")
+    if counts.get("primary_users"):
+        parts.append(f"основной сервер: {counts['primary_users']}")
+    if counts.get("profiles"):
+        parts.append(f"профили: {counts['profiles']}")
+    suffix = "; ".join(parts) if parts else "связи не найдены"
+    return f"Сервер используется в профилях/пользователях ({suffix}). Сначала отключите сервер или используйте принудительное удаление."
+
+
+def remove_node_from_profiles(db: Session, node_id: int, replacement_id: int | None = None) -> int:
+    changed = 0
+    for profile in db.scalars(select(AccessProfile)):
+        current = list(dict.fromkeys(int(item) for item in (profile.allowed_nodes or [])))
+        if node_id not in current:
+            continue
+        next_ids = [item for item in current if item != node_id]
+        if replacement_id is not None and replacement_id not in next_ids:
+            next_ids.append(replacement_id)
+        profile.allowed_nodes = next_ids
+        changed += 1
+    if changed:
+        db.flush()
+    return changed
+
+
+def clear_or_replace_primary_nodes(db: Session, node_id: int, replacement_id: int | None = None) -> int:
+    changed = 0
+    users = list(db.scalars(select(VpnUser).where(VpnUser.primary_node_id == node_id)))
+    for user in users:
+        if replacement_id is not None:
+            user.primary_node_id = replacement_id
+        else:
+            fallback_ids = [item for item in sorted(effective_user_node_ids_for_admin(user)) if item != node_id]
+            user.primary_node_id = fallback_ids[0] if fallback_ids else None
+        changed += 1
+    if changed:
+        db.flush()
+    return changed
+
+
+def detach_node_from_users(db: Session, node_id: int, replacement_id: int | None = None) -> int:
+    changed = 0
+    users = list(
+        db.scalars(
+            select(VpnUser)
+            .join(VpnUserNode, VpnUserNode.vpn_user_id == VpnUser.id)
+            .where(VpnUserNode.node_id == node_id)
+            .distinct()
+        )
+    )
+    for user in users:
+        current = set(user.allowed_node_ids or [])
+        next_ids = set(current)
+        next_ids.discard(node_id)
+        if replacement_id is not None:
+            next_ids.add(replacement_id)
+        if next_ids != current:
+            set_user_node_access(db, user, sorted(next_ids), replacement_id if replacement_id in next_ids else user.primary_node_id)
+            changed += 1
+    return changed
+
+
+def bulk_target_users(db: Session, payload: NodeBulkUserRequest) -> list[VpnUser]:
+    query = select(VpnUser).where(VpnUser.status != UserStatus.deleted.value)
+    if payload.scope == "all_active":
+        query = query.where(VpnUser.status == UserStatus.active.value)
+    elif payload.scope == "department":
+        if not payload.department_id:
+            raise HTTPException(status_code=422, detail="Укажите отдел")
+        query = query.where(VpnUser.department_id == payload.department_id)
+    elif payload.scope == "profile":
+        if not payload.access_profile_id:
+            raise HTTPException(status_code=422, detail="Укажите профиль доступа")
+        query = query.where(VpnUser.access_profile_id == payload.access_profile_id)
+    elif payload.scope == "selected":
+        ids = sorted(set(payload.user_ids or []))
+        if not ids:
+            raise HTTPException(status_code=422, detail="Выберите пользователей")
+        query = query.where(VpnUser.id.in_(ids))
+    else:
+        raise HTTPException(status_code=422, detail="Неизвестный режим массового действия")
+    return list(db.scalars(query.order_by(VpnUser.id)))
+
+
+def config_apply_error(summary: ConfigApplySummary | None) -> str | None:
+    if not summary or summary.failed == 0:
+        return None
+    return "; ".join(result.error or result.node_name for result in summary.results if not result.ok)
+
+
+def bulk_result(
+    message: str,
+    *,
+    users_changed: int = 0,
+    profiles_changed: int = 0,
+    affected_node_ids: set[int] | None = None,
+    summary: ConfigApplySummary | None = None,
+) -> NodeBulkActionResult:
+    return NodeBulkActionResult(
+        ok=not summary or summary.failed == 0,
+        message=message,
+        users_changed=users_changed,
+        profiles_changed=profiles_changed,
+        affected_node_ids=sorted(affected_node_ids or []),
+        apply_status=summary.as_dict() if summary else None,
+        apply_error=config_apply_error(summary),
+    )
 
 
 async def auto_apply_after_change(
@@ -254,7 +408,7 @@ def cache_created_user(key: str | None, user: VpnUser, summary: ConfigApplySumma
 def dashboard(_: Admin = Depends(current_admin), db: Session = Depends(get_db)) -> DashboardStats:
     visible_users = VpnUser.status != UserStatus.deleted.value
     return DashboardStats(
-        nodes_total=db.scalar(select(func.count(VpsNode.id))) or 0,
+        nodes_total=db.scalar(select(func.count(VpsNode.id)).where(VpsNode.status != NodeStatus.deleted.value)) or 0,
         nodes_online=db.scalar(select(func.count(VpsNode.id)).where(VpsNode.status == NodeStatus.online.value)) or 0,
         users_total=db.scalar(select(func.count(VpnUser.id)).where(visible_users)) or 0,
         users_active=db.scalar(select(func.count(VpnUser.id)).where(VpnUser.status == UserStatus.active.value)) or 0,
@@ -280,18 +434,10 @@ def create_profile(payload: AccessProfileCreate, admin: Admin = Depends(require_
 @router.put("/access-profiles/{profile_id}", response_model=AccessProfileRead)
 async def update_profile(profile_id: int, payload: AccessProfileCreate, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> AccessProfile:
     profile = _get_or_404(db, AccessProfile, profile_id)
-    affected_ids = set(
-        db.scalars(
-            select(VpnUserNode.node_id)
-            .join(VpnUser, VpnUser.id == VpnUserNode.vpn_user_id)
-            .where(
-                VpnUser.access_profile_id == profile.id,
-                VpnUser.status != UserStatus.deleted.value,
-            )
-        )
-    )
+    old_allowed_ids = set(profile.allowed_nodes or [])
     for key, value in payload.model_dump().items():
         setattr(profile, key, value)
+    affected_ids = old_allowed_ids | set(profile.allowed_nodes or [])
     audit(db, "update", "access_profile", profile.id, admin.id)
     db.flush()
     summary = await auto_apply_after_change(db, admin, affected_ids or None, "auto_apply_after_profile_update")
@@ -349,13 +495,13 @@ def update_department(department_id: int, payload: DepartmentCreate, admin: Admi
 
 @router.get("/nodes", response_model=list[NodeRead])
 def list_nodes(_: Admin = Depends(current_admin), db: Session = Depends(get_db)) -> list[VpsNode]:
-    return list(db.scalars(select(VpsNode).order_by(VpsNode.created_at.desc())))
+    return list(db.scalars(select(VpsNode).where(VpsNode.status != NodeStatus.deleted.value).order_by(VpsNode.created_at.desc())))
 
 
 @router.get("/nodes/metrics", response_model=list[NodeMetricsRead])
-async def node_metrics(_: Admin = Depends(current_admin), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
-    nodes = list(db.scalars(select(VpsNode).order_by(VpsNode.created_at.desc())))
-    return await collect_nodes_metrics(db, nodes)
+async def node_metrics(period: str = "all", _: Admin = Depends(current_admin), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    nodes = list(db.scalars(select(VpsNode).where(VpsNode.status != NodeStatus.deleted.value).order_by(VpsNode.created_at.desc())))
+    return await collect_nodes_metrics(db, nodes, period)
 
 
 @router.post("/nodes", response_model=NodeRead)
@@ -377,7 +523,10 @@ def create_node(payload: NodeCreate, admin: Admin = Depends(require_write), db: 
 
 @router.get("/nodes/{node_id}", response_model=NodeRead)
 def get_node(node_id: int, _: Admin = Depends(current_admin), db: Session = Depends(get_db)) -> VpsNode:
-    return _get_or_404(db, VpsNode, node_id)
+    node = _get_or_404(db, VpsNode, node_id)
+    if node.status == NodeStatus.deleted.value:
+        raise HTTPException(status_code=404, detail="Сервер не найден")
+    return node
 
 
 @router.post("/nodes/{node_id}/check", response_model=NodeRead)
@@ -540,13 +689,193 @@ def check_sni(payload: SniCheckRequest, _: Admin = Depends(require_write)) -> Sn
     return SniCheckResponse(**check_sni_target(payload.sni).__dict__)
 
 
-@router.delete("/nodes/{node_id}", response_model=Message)
-def delete_node(node_id: int, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> Message:
+@router.post("/nodes/{node_id}/disable", response_model=NodeBulkActionResult)
+async def disable_node(node_id: int, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> NodeBulkActionResult:
     node = _get_or_404(db, VpsNode, node_id)
-    db.delete(node)
-    audit(db, "delete", "vps_node", node_id, admin.id)
+    if node.status == NodeStatus.deleted.value:
+        raise HTTPException(status_code=404, detail="Сервер удален")
+    node.status = NodeStatus.disabled.value
+    audit(db, "disable", "vps_node", node.id, admin.id)
+    db.flush()
+    summary = await ConfigApplyService(db, admin.id).apply_to_nodes(
+        {node.id},
+        reason="auto_apply_after_node_disable",
+        include_uninstalled=True,
+        allow_non_online=True,
+    )
     db.commit()
-    return Message(message="Сервер удален из AKFA. Удаление не трогает Xray на VPS.")
+    return bulk_result("Сервер отключен. Он больше не попадает в подписки.", affected_node_ids={node.id}, summary=summary)
+
+
+@router.post("/nodes/{node_id}/maintenance", response_model=NodeBulkActionResult)
+async def maintenance_node(node_id: int, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> NodeBulkActionResult:
+    node = _get_or_404(db, VpsNode, node_id)
+    if node.status == NodeStatus.deleted.value:
+        raise HTTPException(status_code=404, detail="Сервер удален")
+    node.status = NodeStatus.maintenance.value
+    audit(db, "maintenance", "vps_node", node.id, admin.id)
+    db.flush()
+    summary = await ConfigApplyService(db, admin.id).apply_to_nodes(
+        {node.id},
+        reason="auto_apply_after_node_maintenance",
+        include_uninstalled=True,
+        allow_non_online=True,
+    )
+    db.commit()
+    return bulk_result("Сервер переведен на обслуживание. Он не попадает в подписки.", affected_node_ids={node.id}, summary=summary)
+
+
+@router.post("/nodes/{node_id}/enable", response_model=NodeBulkActionResult)
+async def enable_node(node_id: int, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> NodeBulkActionResult:
+    node = _get_or_404(db, VpsNode, node_id)
+    if node.status == NodeStatus.deleted.value:
+        raise HTTPException(status_code=404, detail="Сервер удален")
+    node.status = NodeStatus.online.value
+    audit(db, "enable", "vps_node", node.id, admin.id)
+    db.flush()
+    summary = await safe_auto_apply_after_change(db, admin, {node.id}, "auto_apply_after_node_enable")
+    db.commit()
+    return bulk_result("Сервер включен и снова может попадать в подписки.", affected_node_ids={node.id}, summary=summary)
+
+
+@router.post("/nodes/{node_id}/profiles/add", response_model=NodeBulkActionResult)
+async def add_node_to_profile(node_id: int, payload: NodeProfileActionRequest, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> NodeBulkActionResult:
+    node = _get_or_404(db, VpsNode, node_id)
+    if node.status == NodeStatus.deleted.value:
+        raise HTTPException(status_code=404, detail="Сервер удален")
+    profile = _get_or_404(db, AccessProfile, payload.profile_id)
+    current = list(dict.fromkeys(profile.allowed_nodes or []))
+    changed = 0
+    if node.id not in current:
+        profile.allowed_nodes = current + [node.id]
+        changed = 1
+    audit(db, "add_node_to_profile", "vps_node", node.id, admin.id, metadata={"profile_id": profile.id})
+    db.flush()
+    summary = await safe_auto_apply_after_change(db, admin, {node.id}, "auto_apply_after_node_profile_add")
+    db.commit()
+    return bulk_result(f"Сервер добавлен в профиль «{profile.name}».", profiles_changed=changed, affected_node_ids={node.id}, summary=summary)
+
+
+@router.post("/nodes/{node_id}/profiles/remove", response_model=NodeBulkActionResult)
+async def remove_node_from_profile(node_id: int, payload: NodeProfileActionRequest, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> NodeBulkActionResult:
+    node = _get_or_404(db, VpsNode, node_id)
+    profile = _get_or_404(db, AccessProfile, payload.profile_id)
+    current = list(dict.fromkeys(profile.allowed_nodes or []))
+    changed = 0
+    if node.id in current:
+        profile.allowed_nodes = [item for item in current if item != node.id]
+        changed = 1
+    audit(db, "remove_node_from_profile", "vps_node", node.id, admin.id, metadata={"profile_id": profile.id})
+    db.flush()
+    summary = await safe_auto_apply_after_change(db, admin, {node.id}, "auto_apply_after_node_profile_remove")
+    db.commit()
+    return bulk_result(f"Сервер убран из профиля «{profile.name}».", profiles_changed=changed, affected_node_ids={node.id}, summary=summary)
+
+
+@router.post("/nodes/{node_id}/users/add", response_model=NodeBulkActionResult)
+async def add_node_to_users(node_id: int, payload: NodeBulkUserRequest, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> NodeBulkActionResult:
+    node = _get_or_404(db, VpsNode, node_id)
+    if node.status == NodeStatus.deleted.value:
+        raise HTTPException(status_code=404, detail="Сервер удален")
+    changed = 0
+    for user in bulk_target_users(db, payload):
+        current = set(user.allowed_node_ids or []) or profile_node_ids(user.access_profile)
+        if node.id in current:
+            continue
+        current.add(node.id)
+        set_user_node_access(db, user, sorted(current), user.primary_node_id or node.id)
+        changed += 1
+    audit(db, "bulk_add_node_to_users", "vps_node", node.id, admin.id, metadata={"users_changed": changed})
+    db.flush()
+    summary = await safe_auto_apply_after_change(db, admin, {node.id}, "auto_apply_after_bulk_node_user_add")
+    db.commit()
+    return bulk_result(f"Сервер добавлен пользователям: {changed}.", users_changed=changed, affected_node_ids={node.id}, summary=summary)
+
+
+@router.post("/nodes/{node_id}/users/remove", response_model=NodeBulkActionResult)
+async def remove_node_from_users(node_id: int, payload: NodeBulkUserRequest, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> NodeBulkActionResult:
+    node = _get_or_404(db, VpsNode, node_id)
+    changed = 0
+    for user in bulk_target_users(db, payload):
+        current = set(user.allowed_node_ids or []) or profile_node_ids(user.access_profile)
+        if node.id not in current:
+            continue
+        current.remove(node.id)
+        primary = user.primary_node_id
+        if primary == node.id:
+            primary = min(current) if current else None
+        set_user_node_access(db, user, sorted(current), primary)
+        changed += 1
+    audit(db, "bulk_remove_node_from_users", "vps_node", node.id, admin.id, metadata={"users_changed": changed})
+    db.flush()
+    summary = await safe_auto_apply_after_change(db, admin, {node.id}, "auto_apply_after_bulk_node_user_remove")
+    db.commit()
+    return bulk_result(f"Сервер убран у пользователей: {changed}.", users_changed=changed, affected_node_ids={node.id}, summary=summary)
+
+
+@router.post("/nodes/{node_id}/replace", response_model=NodeBulkActionResult)
+async def replace_node(node_id: int, payload: NodeReplaceRequest, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> NodeBulkActionResult:
+    old_node = _get_or_404(db, VpsNode, node_id)
+    new_node = _get_or_404(db, VpsNode, payload.new_node_id)
+    if old_node.id == new_node.id:
+        raise HTTPException(status_code=422, detail="Выберите другой сервер для замены")
+    if new_node.status == NodeStatus.deleted.value:
+        raise HTTPException(status_code=422, detail="Новый сервер удален")
+    users_changed = detach_node_from_users(db, old_node.id, new_node.id)
+    profiles_changed = remove_node_from_profiles(db, old_node.id, new_node.id)
+    primary_changed = clear_or_replace_primary_nodes(db, old_node.id, new_node.id)
+    users_changed = max(users_changed, primary_changed)
+    audit(db, "replace_node", "vps_node", old_node.id, admin.id, metadata={"new_node_id": new_node.id, "users_changed": users_changed, "profiles_changed": profiles_changed})
+    db.flush()
+    affected_ids = {old_node.id, new_node.id}
+    summary = await ConfigApplyService(db, admin.id).apply_to_nodes(
+        affected_ids,
+        reason="auto_apply_after_node_replace",
+        include_uninstalled=True,
+        allow_non_online=True,
+    )
+    db.commit()
+    return bulk_result(
+        f"Сервер «{old_node.name}» заменен на «{new_node.name}».",
+        users_changed=users_changed,
+        profiles_changed=profiles_changed,
+        affected_node_ids=affected_ids,
+        summary=summary,
+    )
+
+
+@router.delete("/nodes/{node_id}", response_model=NodeBulkActionResult)
+async def delete_node(node_id: int, force: bool = False, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> NodeBulkActionResult:
+    node = _get_or_404(db, VpsNode, node_id)
+    if node.status == NodeStatus.deleted.value:
+        return bulk_result("Сервер уже удален.", affected_node_ids={node.id})
+    counts = node_usage_counts(db, node.id)
+    if not force and any(counts.values()):
+        raise HTTPException(status_code=409, detail=node_in_use_message(counts))
+
+    users_changed = detach_node_from_users(db, node.id)
+    profiles_changed = remove_node_from_profiles(db, node.id)
+    primary_changed = clear_or_replace_primary_nodes(db, node.id)
+    users_changed = max(users_changed, primary_changed)
+    node.status = NodeStatus.disabled.value
+    audit(db, "force_delete" if force else "delete", "vps_node", node.id, admin.id, metadata={"force": force, "users_changed": users_changed, "profiles_changed": profiles_changed})
+    db.flush()
+    summary = await ConfigApplyService(db, admin.id).apply_to_nodes(
+        {node.id},
+        reason="auto_apply_before_node_delete",
+        include_uninstalled=True,
+        allow_non_online=True,
+    )
+    node.status = NodeStatus.deleted.value
+    db.commit()
+    verb = "принудительно удален" if force else "удален"
+    return bulk_result(
+        f"Сервер {verb} из AKFA. Xray и файлы на VPS не удаляются.",
+        users_changed=users_changed,
+        profiles_changed=profiles_changed,
+        affected_node_ids={node.id},
+        summary=summary,
+    )
 
 
 @router.get("/users", response_model=list[VpnUserRead])
@@ -621,9 +950,12 @@ async def create_user_unlocked(
     if not expires_at and profile and profile.expires_in_days:
         expires_at = datetime.now(timezone.utc) + timedelta(days=profile.expires_in_days)
     allowed_node_ids = normalize_allowed_node_ids(db, payload.allowed_node_ids, payload.status)
-    if payload.status == UserStatus.active.value and not allowed_node_ids and has_online_nodes(db):
+    if not allowed_node_ids and not profile_node_ids(profile) and payload.status == UserStatus.active.value:
+        allowed_node_ids = default_allowed_node_ids(db)
+    effective_ids = set(allowed_node_ids) or profile_node_ids(profile)
+    if payload.status == UserStatus.active.value and not effective_ids and has_online_nodes(db):
         raise HTTPException(status_code=422, detail="Активному пользователю нужен хотя бы один доступный сервер")
-    if payload.primary_node_id and payload.primary_node_id not in allowed_node_ids:
+    if payload.primary_node_id and payload.primary_node_id not in effective_ids:
         raise HTTPException(status_code=422, detail="Основной сервер должен входить в доступные серверы")
     data = payload.model_dump(exclude={"expires_at", "traffic_limit_bytes", "allowed_node_ids", "primary_node_id"})
     user = VpnUser(
@@ -643,7 +975,7 @@ async def create_user_unlocked(
     logger.info("create user db flushed admin_id=%s user_id=%s username=%s request_id=%s", admin.id, user.id, user.username, idempotency_key)
     _, new_ids = set_user_node_access(db, user, allowed_node_ids, payload.primary_node_id)
     audit(db, "create", "vpn_user", user.id, admin.id)
-    summary = await safe_auto_apply_after_change(db, admin, new_ids, "auto_apply_after_user_create")
+    summary = await safe_auto_apply_after_change(db, admin, new_ids or effective_ids, "auto_apply_after_user_create")
     try:
         db.commit()
     except IntegrityError as exc:
@@ -691,16 +1023,21 @@ async def update_user(user_id: int, payload: VpnUserCreate, admin: Admin = Depen
     active_devices = user.active_devices_count
     if payload.device_limit < active_devices:
         raise HTTPException(status_code=400, detail="Нельзя установить лимит меньше текущего количества активных устройств.")
+    old_ids = affected_node_ids_for_user(user)
     allowed_node_ids = normalize_allowed_node_ids(db, payload.allowed_node_ids, payload.status)
-    if payload.status == UserStatus.active.value and not allowed_node_ids and has_online_nodes(db):
+    profile = db.get(AccessProfile, payload.access_profile_id) if payload.access_profile_id else None
+    if not allowed_node_ids and not profile_node_ids(profile) and payload.status == UserStatus.active.value:
+        allowed_node_ids = default_allowed_node_ids(db)
+    effective_ids = set(allowed_node_ids) or profile_node_ids(profile)
+    if payload.status == UserStatus.active.value and not effective_ids and has_online_nodes(db):
         raise HTTPException(status_code=422, detail="Активному пользователю нужен хотя бы один доступный сервер")
-    if payload.primary_node_id and payload.primary_node_id not in allowed_node_ids:
+    if payload.primary_node_id and payload.primary_node_id not in effective_ids:
         raise HTTPException(status_code=422, detail="Основной сервер должен входить в доступные серверы")
     for key, value in payload.model_dump(exclude={"allowed_node_ids", "primary_node_id"}).items():
         setattr(user, key, value)
-    old_ids, new_ids = set_user_node_access(db, user, allowed_node_ids, payload.primary_node_id)
+    _, new_ids = set_user_node_access(db, user, allowed_node_ids, payload.primary_node_id)
     audit(db, "update", "vpn_user", user.id, admin.id)
-    summary = await safe_auto_apply_after_change(db, admin, old_ids | new_ids, "auto_apply_after_user_update")
+    summary = await safe_auto_apply_after_change(db, admin, old_ids | (new_ids or effective_ids), "auto_apply_after_user_update")
     try:
         db.commit()
     except IntegrityError as exc:
@@ -713,7 +1050,7 @@ async def update_user(user_id: int, payload: VpnUserCreate, admin: Admin = Depen
 @router.delete("/users/{user_id}", response_model=Message)
 async def delete_user(user_id: int, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> Message:
     user = _get_or_404(db, VpnUser, user_id)
-    affected_ids = set(user.allowed_node_ids or [])
+    affected_ids = affected_node_ids_for_user(user)
     logger.info("delete user start admin_id=%s user_id=%s status=%s nodes=%s", admin.id, user.id, user.status, sorted(affected_ids))
     if user.status == UserStatus.deleted.value:
         logger.info("delete user already_deleted admin_id=%s user_id=%s", admin.id, user.id)

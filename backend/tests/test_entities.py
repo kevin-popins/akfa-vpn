@@ -3,10 +3,12 @@ import json
 import tarfile
 import time
 import asyncio
+import hashlib
 
 from sqlalchemy.orm import sessionmaker
 
 import app.services.node_action_jobs as node_action_jobs
+from app.models import DeviceStatus, NodeStatus, VpnUser, VpnUserDevice, VpsNode
 from app.services.ssh_installer import InstallResult, READ_ONLY_CHECK_COMMANDS, XrayInstaller
 
 
@@ -180,6 +182,169 @@ def test_node_rejects_sni_with_path(client, auth_headers):
     assert response.status_code == 422
 
 
+def test_delete_unused_node_soft_deletes_without_fk_error(client, auth_headers):
+    created = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "Unused", "ip_address": "203.0.113.91", "ssh_username": "root", "ssh_password": "secret"},
+    )
+    assert created.status_code == 200
+    node_id = created.json()["id"]
+
+    deleted = client.delete(f"/admin/nodes/{node_id}", headers=auth_headers)
+    assert deleted.status_code == 200
+    assert "удален" in deleted.json()["message"]
+
+    nodes = client.get("/admin/nodes", headers=auth_headers).json()
+    assert node_id not in {node["id"] for node in nodes}
+
+
+def test_delete_used_node_returns_clear_error_and_force_detaches(client, auth_headers):
+    node = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "Used", "ip_address": "203.0.113.92", "ssh_username": "root", "ssh_password": "secret"},
+    ).json()
+    user = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={
+            "first_name": "Node",
+            "last_name": "User",
+            "username": "node-user",
+            "allowed_node_ids": [node["id"]],
+            "primary_node_id": node["id"],
+        },
+    )
+    assert user.status_code == 200
+
+    blocked = client.delete(f"/admin/nodes/{node['id']}", headers=auth_headers)
+    assert blocked.status_code == 409
+    assert "Сервер используется" in blocked.json()["detail"]
+
+    forced = client.delete(f"/admin/nodes/{node['id']}?force=true", headers=auth_headers)
+    assert forced.status_code == 200
+    refreshed = client.get(f"/admin/users/{user.json()['id']}", headers=auth_headers).json()
+    assert refreshed["allowed_node_ids"] == []
+    assert refreshed["primary_node_id"] is None
+
+
+def test_replace_node_updates_user_links_and_primary(client, auth_headers):
+    old_node = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "Old", "ip_address": "203.0.113.93", "ssh_username": "root", "ssh_password": "secret"},
+    ).json()
+    new_node = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "New", "ip_address": "203.0.113.94", "ssh_username": "root", "ssh_password": "secret"},
+    ).json()
+    user = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={
+            "first_name": "Replace",
+            "last_name": "User",
+            "username": "replace-user",
+            "allowed_node_ids": [old_node["id"]],
+            "primary_node_id": old_node["id"],
+        },
+    ).json()
+
+    response = client.post(f"/admin/nodes/{old_node['id']}/replace", headers=auth_headers, json={"new_node_id": new_node["id"]})
+    assert response.status_code == 200
+    refreshed = client.get(f"/admin/users/{user['id']}", headers=auth_headers).json()
+    assert refreshed["allowed_node_ids"] == [new_node["id"]]
+    assert refreshed["primary_node_id"] == new_node["id"]
+
+
+def test_profile_nodes_are_inherited_and_explicit_nodes_override(client, auth_headers, db_session):
+    profile_node = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "Profile Node", "ip_address": "203.0.113.95", "ssh_username": "root", "ssh_password": "secret"},
+    ).json()
+    explicit_node = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "Explicit Node", "ip_address": "203.0.113.96", "ssh_username": "root", "ssh_password": "secret"},
+    ).json()
+    profile = client.post(
+        "/admin/access-profiles",
+        headers=auth_headers,
+        json={"name": "Profile Nodes", "routing_mode": "full_tunnel", "allowed_nodes": [profile_node["id"]]},
+    ).json()
+
+    inherited = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={"first_name": "Inherit", "last_name": "User", "username": "inherit-user", "access_profile_id": profile["id"]},
+    ).json()
+    explicit = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={
+            "first_name": "Explicit",
+            "last_name": "User",
+            "username": "explicit-user",
+            "access_profile_id": profile["id"],
+            "allowed_node_ids": [explicit_node["id"]],
+        },
+    ).json()
+
+    from app.services.xray_config import effective_node_ids
+
+    assert inherited["allowed_node_ids"] == []
+    assert explicit["allowed_node_ids"] == [explicit_node["id"]]
+    inherited_model = db_session.get(VpnUser, inherited["id"])
+    explicit_model = db_session.get(VpnUser, explicit["id"])
+    assert effective_node_ids(inherited_model) == {profile_node["id"]}
+    assert effective_node_ids(explicit_model) == {explicit_node["id"]}
+
+
+def test_disabled_node_is_excluded_from_user_subscription(client, auth_headers, db_session):
+    node = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "Sub Node", "ip_address": "203.0.113.97", "ssh_username": "root", "ssh_password": "secret", "public_host": "vpn.example.com"},
+    ).json()
+    node_model = db_session.get(VpsNode, node["id"])
+    node_model.status = NodeStatus.online.value
+    db_session.commit()
+    user = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={
+            "first_name": "Sub",
+            "last_name": "User",
+            "username": "sub-user",
+            "allowed_node_ids": [node["id"]],
+            "primary_node_id": node["id"],
+        },
+    ).json()
+    device = VpnUserDevice(
+        vpn_user_id=user["id"],
+        uuid="11111111-1111-4111-8111-111111111111",
+        subscription_token="device-token",
+        status=DeviceStatus.active.value,
+        hwid_hash=hashlib.sha256("phone-1".encode("utf-8")).hexdigest(),
+        hwid_masked="phone-1",
+    )
+    db_session.add(device)
+    db_session.commit()
+
+    ok = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "phone-1"})
+    assert ok.status_code == 200
+    assert "vpn.example.com" in ok.text
+
+    disabled = client.post(f"/admin/nodes/{node['id']}/disable", headers=auth_headers)
+    assert disabled.status_code == 200
+    blocked = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "phone-1"})
+    assert blocked.status_code == 404
+    assert "Нет доступных серверов" in blocked.text
+
+
 def test_user_maintenance_actions(client, auth_headers):
     user = client.post(
         "/admin/users",
@@ -247,7 +412,7 @@ def test_delete_node_removes_akfa_record(client, auth_headers):
     ).json()
     response = client.delete(f"/admin/nodes/{node['id']}", headers=auth_headers)
     assert response.status_code == 200
-    assert "не трогает Xray" in response.json()["message"]
+    assert "Xray и файлы на VPS не удаляются" in response.json()["message"]
     missing = client.get(f"/admin/nodes/{node['id']}")
     assert missing.status_code == 404
 

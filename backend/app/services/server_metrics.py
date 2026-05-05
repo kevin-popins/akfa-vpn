@@ -1,14 +1,14 @@
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import asyncssh
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.security import decrypt_secret
-from app.models import NodeStatus, UserStatus, VpsNode, VpnUser
+from app.models import NodeStatus, TrafficSnapshot, VpsNode
 from app.services.traffic import XRAY_STATS_COMMAND
 
 INBOUND_TRAFFIC_RE = re.compile(r"inbound>>>([^>]+)>>>traffic>>>(uplink|downlink)")
@@ -18,16 +18,16 @@ DISK_COMMAND = "df -B1 /"
 IGNORED_INBOUND_TAGS = {"api-in", "api"}
 
 
-async def collect_nodes_metrics(db: Session, nodes: list[VpsNode]) -> list[dict[str, Any]]:
+async def collect_nodes_metrics(db: Session, nodes: list[VpsNode], period: str = "all") -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for node in nodes:
-        rows.append(await collect_node_metrics(db, node))
+        rows.append(await collect_node_metrics(db, node, period))
     db.commit()
     return rows
 
 
-async def collect_node_metrics(db: Session, node: VpsNode) -> dict[str, Any]:
-    row = base_metric_row(node)
+async def collect_node_metrics(db: Session, node: VpsNode, period: str = "all") -> dict[str, Any]:
+    row = base_metric_row(db, node, period)
     if node.status != NodeStatus.online.value:
         row["errors"].append("Нода не online")
         return row
@@ -39,19 +39,20 @@ async def collect_node_metrics(db: Session, node: VpsNode) -> dict[str, Any]:
         inbound_raw = parse_inbound_stats(command_outputs.get("xray", ""))
         collected_at = datetime.now(timezone.utc)
         if inbound_raw["upload"] > 0 or inbound_raw["download"] > 0:
-            apply_node_raw_counters(node, inbound_raw["upload"], inbound_raw["download"], collected_at)
+            apply_node_raw_counters(db, node, inbound_raw["upload"], inbound_raw["download"], collected_at)
             traffic_source = "xray_inbound"
         else:
-            apply_user_sum_fallback(db, node, collected_at)
-            traffic_source = "users_sum_fallback"
+            node.last_metrics_collected_at = collected_at
+            traffic_source = "node_traffic"
+        traffic = aggregate_node_traffic(db, node.id, period)
         row.update(
             {
                 "cpu_percent": cpu_percent,
                 **ram,
                 **disk,
-                "traffic_upload_bytes": node.traffic_upload_bytes or 0,
-                "traffic_download_bytes": node.traffic_download_bytes or 0,
-                "traffic_total_bytes": node.traffic_total_bytes or 0,
+                "traffic_upload_bytes": traffic["upload"],
+                "traffic_download_bytes": traffic["download"],
+                "traffic_total_bytes": traffic["total"],
                 "traffic_source": traffic_source,
                 "last_checked_at": node.last_metrics_collected_at,
             }
@@ -88,7 +89,8 @@ async def run_node_metric_commands(node: VpsNode) -> dict[str, str]:
     return outputs
 
 
-def base_metric_row(node: VpsNode) -> dict[str, Any]:
+def base_metric_row(db: Session, node: VpsNode, period: str = "all") -> dict[str, Any]:
+    traffic = aggregate_node_traffic(db, node.id, period)
     return {
         "node_id": node.id,
         "name": node.name,
@@ -101,10 +103,10 @@ def base_metric_row(node: VpsNode) -> dict[str, Any]:
         "disk_used_bytes": None,
         "disk_total_bytes": None,
         "disk_percent": None,
-        "traffic_upload_bytes": node.traffic_upload_bytes or 0,
-        "traffic_download_bytes": node.traffic_download_bytes or 0,
-        "traffic_total_bytes": node.traffic_total_bytes or 0,
-        "traffic_source": "xray_inbound" if (node.last_raw_inbound_upload_bytes or node.last_raw_inbound_download_bytes) else "users_sum_fallback",
+        "traffic_upload_bytes": traffic["upload"],
+        "traffic_download_bytes": traffic["download"],
+        "traffic_total_bytes": traffic["total"],
+        "traffic_source": "node_traffic",
         "last_checked_at": node.last_metrics_collected_at,
         "errors": [],
     }
@@ -189,7 +191,20 @@ def parse_inbound_raw_stats(output: str) -> list[dict[str, int | str]]:
     return raw_stats
 
 
-def apply_node_raw_counters(node: VpsNode, raw_upload: int, raw_download: int, collected_at: datetime) -> dict[str, int]:
+def apply_node_raw_counters(db_or_node: Session | VpsNode, node_or_upload: VpsNode | int, raw_upload_or_download: int, raw_download_or_collected_at: int | datetime, collected_at: datetime | None = None) -> dict[str, int]:
+    if isinstance(db_or_node, Session):
+        db: Session | None = db_or_node
+        node = node_or_upload
+        raw_upload = int(raw_upload_or_download)
+        raw_download = int(raw_download_or_collected_at)
+        collected = collected_at or datetime.now(timezone.utc)
+    else:
+        db = None
+        node = db_or_node
+        raw_upload = int(node_or_upload)
+        raw_download = int(raw_upload_or_download)
+        collected = raw_download_or_collected_at if isinstance(raw_download_or_collected_at, datetime) else datetime.now(timezone.utc)
+    assert isinstance(node, VpsNode)
     previous_upload = node.last_raw_inbound_upload_bytes or 0
     previous_download = node.last_raw_inbound_download_bytes or 0
     first_collection = previous_upload == 0 and previous_download == 0
@@ -207,19 +222,40 @@ def apply_node_raw_counters(node: VpsNode, raw_upload: int, raw_download: int, c
     node.traffic_upload_bytes = (node.traffic_upload_bytes or 0) + upload_delta
     node.traffic_download_bytes = (node.traffic_download_bytes or 0) + download_delta
     node.traffic_total_bytes = (node.traffic_total_bytes or 0) + upload_delta + download_delta
-    node.last_metrics_collected_at = collected_at
+    node.last_metrics_collected_at = collected
+    if db is not None and upload_delta + download_delta > 0:
+        db.add(
+            TrafficSnapshot(
+                vpn_user_id=None,
+                node_id=node.id,
+                upload_bytes=upload_delta,
+                download_bytes=download_delta,
+                total_bytes=upload_delta + download_delta,
+                collected_at=collected,
+            )
+        )
     return {"upload_delta": upload_delta, "download_delta": download_delta, "delta_total": upload_delta + download_delta}
 
 
-def apply_user_sum_fallback(db: Session, node: VpsNode, collected_at: datetime) -> None:
-    upload = db.scalar(
-        select(VpnUser.used_upload_bytes).where(VpnUser.status == UserStatus.active.value).limit(1)
-    )
-    if upload is None:
-        node.last_metrics_collected_at = collected_at
-        return
-    users = db.scalars(select(VpnUser).where(VpnUser.status == UserStatus.active.value)).all()
-    node.traffic_upload_bytes = sum(user.used_upload_bytes or 0 for user in users)
-    node.traffic_download_bytes = sum(user.used_download_bytes or 0 for user in users)
-    node.traffic_total_bytes = sum(user.used_total_bytes or 0 for user in users)
-    node.last_metrics_collected_at = collected_at
+def period_start(period: str, now: datetime | None = None) -> datetime | None:
+    now = now or datetime.now(timezone.utc)
+    if period == "today":
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if period in {"7d", "week"}:
+        return now - timedelta(days=7)
+    if period in {"month", "this_month"}:
+        return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return None
+
+
+def aggregate_node_traffic(db: Session, node_id: int, period: str = "all") -> dict[str, int]:
+    query = select(
+        func.coalesce(func.sum(TrafficSnapshot.upload_bytes), 0),
+        func.coalesce(func.sum(TrafficSnapshot.download_bytes), 0),
+        func.coalesce(func.sum(TrafficSnapshot.total_bytes), 0),
+    ).where(TrafficSnapshot.node_id == node_id)
+    start = period_start(period)
+    if start is not None:
+        query = query.where(TrafficSnapshot.collected_at >= start)
+    upload, download, total = db.execute(query).one()
+    return {"upload": int(upload or 0), "download": int(download or 0), "total": int(total or 0)}

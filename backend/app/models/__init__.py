@@ -28,6 +28,9 @@ class NodeStatus(StrEnum):
     offline = "offline"
     installing = "installing"
     failed = "failed"
+    disabled = "disabled"
+    maintenance = "maintenance"
+    deleted = "deleted"
 
 
 class NodeManagedMode(StrEnum):
@@ -297,7 +300,7 @@ class TrafficSnapshot(Base):
     __tablename__ = "traffic_snapshots"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    vpn_user_id: Mapped[int] = mapped_column(ForeignKey("vpn_users.id"))
+    vpn_user_id: Mapped[int | None] = mapped_column(ForeignKey("vpn_users.id"), nullable=True)
     node_id: Mapped[int] = mapped_column(ForeignKey("vps_nodes.id"))
     upload_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     download_bytes: Mapped[int] = mapped_column(BigInteger, default=0)

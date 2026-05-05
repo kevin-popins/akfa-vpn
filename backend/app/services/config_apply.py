@@ -137,6 +137,8 @@ class ConfigApplyService:
             if not node_ids:
                 return []
             query = query.where(VpsNode.id.in_(node_ids))
+        else:
+            query = query.where(VpsNode.status != NodeStatus.deleted.value)
         return list(self.db.scalars(query))
 
     def _fresh_users(self) -> list[VpnUser]:
@@ -182,7 +184,8 @@ class ConfigApplyService:
         node.last_check_at = applied_at
         node.last_config_version = config_version
         if result.ok:
-            node.status = NodeStatus.online.value
+            if node.status not in {NodeStatus.disabled.value, NodeStatus.maintenance.value, NodeStatus.deleted.value}:
+                node.status = NodeStatus.online.value
             node.last_config_applied_at = applied_at
             node.last_config_apply_status = APPLY_SUCCESS
             node.last_config_apply_error = None

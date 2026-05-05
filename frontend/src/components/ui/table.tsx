@@ -19,6 +19,7 @@ export function StatusBadge({ value }: { value: string }) {
     offline: "Не в сети",
     installing: "Установка",
     failed: "Ошибка",
+    maintenance: "Обслуживание",
     full_tunnel: "Весь трафик через VPN",
     ru_direct: "Российские сервисы напрямую",
     custom_direct_domains: "Пользовательские direct-домены",

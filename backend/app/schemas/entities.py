@@ -155,6 +155,32 @@ class NodeActionJobRead(BaseModel):
     updated_at: datetime
 
 
+class NodeBulkUserRequest(BaseModel):
+    scope: str = "all_active"
+    department_id: int | None = None
+    access_profile_id: int | None = None
+    user_ids: list[int] = Field(default_factory=list)
+
+
+class NodeProfileActionRequest(BaseModel):
+    profile_id: int
+
+
+class NodeReplaceRequest(BaseModel):
+    new_node_id: int
+
+
+class NodeBulkActionResult(BaseModel):
+    ok: bool = True
+    message: str
+    users_changed: int = 0
+    profiles_changed: int = 0
+    affected_node_ids: list[int] = Field(default_factory=list)
+    apply_status: ConfigApplySummaryRead | None = None
+    apply_error: str | None = None
+    errors: list[str] = Field(default_factory=list)
+
+
 class NodeMetricsRead(BaseModel):
     node_id: int
     name: str
@@ -170,7 +196,7 @@ class NodeMetricsRead(BaseModel):
     traffic_upload_bytes: int = 0
     traffic_download_bytes: int = 0
     traffic_total_bytes: int = 0
-    traffic_source: str = "users_sum_fallback"
+    traffic_source: str = "node_traffic"
     last_checked_at: datetime | None = None
     errors: list[str] = Field(default_factory=list)
 
@@ -277,7 +303,7 @@ class RestoreSummary(BaseModel):
 
 class TrafficSnapshotRead(OrmModel):
     id: int
-    vpn_user_id: int
+    vpn_user_id: int | None = None
     node_id: int
     upload_bytes: int
     download_bytes: int

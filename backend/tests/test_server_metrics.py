@@ -1,8 +1,10 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from app.models import AuditLog, VpsNode
+from app.models import AuditLog, TrafficSnapshot, VpsNode
 from app.services.server_metrics import (
+    aggregate_node_traffic,
     apply_node_raw_counters,
+    base_metric_row,
     parse_cpu_percent,
     parse_df_output,
     parse_free_output,
@@ -47,6 +49,33 @@ def test_node_traffic_first_second_and_counter_decrease():
     assert node.traffic_total_bytes == 410
     assert node.last_raw_inbound_upload_bytes == 10
     assert node.last_raw_inbound_download_bytes == 20
+
+
+def test_node_traffic_snapshots_are_server_level_and_periodic(db_session):
+    node = VpsNode(name="Snapshot Node", ip_address="203.0.113.92", ssh_username="root")
+    db_session.add(node)
+    db_session.flush()
+    now = datetime.now(timezone.utc)
+
+    result = apply_node_raw_counters(db_session, node, 100, 250, now)
+    assert result == {"upload_delta": 100, "download_delta": 250, "delta_total": 350}
+    db_session.add(
+        TrafficSnapshot(
+            vpn_user_id=None,
+            node_id=node.id,
+            upload_bytes=10,
+            download_bytes=20,
+            total_bytes=30,
+            collected_at=now - timedelta(days=9),
+        )
+    )
+    db_session.commit()
+
+    assert aggregate_node_traffic(db_session, node.id, "all") == {"upload": 110, "download": 270, "total": 380}
+    assert aggregate_node_traffic(db_session, node.id, "7d") == {"upload": 100, "download": 250, "total": 350}
+    row = base_metric_row(db_session, node, "all")
+    assert row["traffic_source"] == "node_traffic"
+    assert row["traffic_total_bytes"] == 380
 
 
 def test_background_collect_does_not_create_audit_entry(client, auth_headers, db_session):

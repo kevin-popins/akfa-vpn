@@ -13,6 +13,8 @@ def active_users(users: list[VpnUser]) -> list[VpnUser]:
 
 
 def active_hwid_devices_for_node(users: list[VpnUser], node: VpsNode) -> list[tuple[VpnUser, VpnUserDevice]]:
+    if node.status != NodeStatus.online.value:
+        return []
     pairs: list[tuple[VpnUser, VpnUserDevice]] = []
     for user in active_users(users):
         if not user_allowed_on_node(user, node):
