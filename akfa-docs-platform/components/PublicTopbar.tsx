@@ -11,8 +11,8 @@ export function PublicTopbar() {
     <header className="topbar">
       <div className="topbar-inner">
         <Link href="/" className="brand">
-          <span className="brand-mark">A</span>
-          <span>AKFA VPN</span>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img className="brand-logo" src="/assets/akfa-logo.svg" alt="AKFA VPN" />
         </Link>
         <nav className="topnav" aria-label="Главная навигация">
           <Link href={publicRoutes.docs}>Документация</Link>

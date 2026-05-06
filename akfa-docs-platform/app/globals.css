@@ -72,14 +72,17 @@ select {
   font-weight: 800;
 }
 
-.brand-mark {
-  display: grid;
-  width: 34px;
-  height: 34px;
-  place-items: center;
-  border-radius: 10px;
-  background: var(--red);
-  color: white;
+.brand-logo {
+  display: block;
+  width: auto;
+  height: 32px;
+  max-width: none;
+  object-fit: contain;
+  flex-shrink: 0;
+}
+
+.admin-brand-logo {
+  height: 32px;
 }
 
 .topnav {

@@ -1,7 +1,6 @@
 import {
   Activity,
   ClipboardList,
-  Download,
   Gauge,
   KeyRound,
   Layers,
@@ -9,7 +8,6 @@ import {
   Server,
   Settings,
   ShieldCheck,
-  Upload,
   UserCog,
   Users,
   Menu,
@@ -48,9 +46,7 @@ const nav = [
   { key: "departments", label: "Отделы", icon: Layers },
   { key: "profiles", label: "Профили доступа", icon: Lock },
   { key: "users", label: "Пользователи VPN", icon: Users },
-  { key: "bulk-import", label: "Массовый импорт", icon: Upload },
   { key: "traffic", label: "Аналитика трафика", icon: Activity },
-  { key: "backup", label: "Бэкап", icon: Download },
   { key: "audit", label: "Журнал аудита", icon: ClipboardList },
   { key: "settings", label: "Настройки администратора", icon: UserCog }
 ] as const;
@@ -79,12 +75,8 @@ export function Layout({
   const sidebar = (
     <>
       <div className="flex h-16 items-center justify-between gap-3 border-b border-akfa-line px-5">
-        <div className="flex items-center gap-3">
-          <div className="grid h-9 w-9 place-items-center rounded-md bg-akfa-red text-lg font-bold text-white">A</div>
-          <div>
-            <div className="text-lg font-semibold">AKFA</div>
-            <div className="text-xs text-akfa-muted">Управление доступом</div>
-          </div>
+        <div className="flex min-w-0 items-center gap-3">
+          <img className="h-8 w-auto shrink-0 object-contain" src="/assets/akfa-logo.svg" alt="AKFA VPN" />
         </div>
         <button className="rounded-md p-2 text-zinc-600 hover:bg-akfa-soft lg:hidden" type="button" aria-label="Закрыть меню" onClick={() => setMobileOpen(false)}>
           <X size={18} />
@@ -126,7 +118,7 @@ export function Layout({
           </aside>
         </div>
       ) : null}
-      <main className="lg:pl-64">
+      <main className="min-w-0 lg:pl-64">
         <header className="sticky top-0 z-20 flex h-16 items-center justify-between border-b border-akfa-line bg-white/95 px-4 backdrop-blur lg:px-8">
           <div className="flex min-w-0 items-center gap-3">
             <button className="rounded-md border border-akfa-line bg-white p-2 text-zinc-700 hover:border-akfa-red lg:hidden" type="button" aria-label="Открыть меню" onClick={() => setMobileOpen(true)}>
@@ -142,7 +134,7 @@ export function Layout({
             Обновить
           </Button>
         </header>
-        <div className="w-full px-4 py-6 lg:px-6 xl:px-8">
+        <div className="min-w-0 max-w-full px-4 py-6 lg:px-6 xl:px-8">
           {children}
         </div>
       </main>

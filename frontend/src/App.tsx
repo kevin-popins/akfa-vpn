@@ -142,7 +142,11 @@ function App() {
 }
 
 function Splash() {
-  return <div className="grid min-h-screen place-items-center text-sm text-akfa-muted">AKFA</div>;
+  return (
+    <div className="grid min-h-screen place-items-center">
+      <img className="h-10 w-auto object-contain" src="/assets/akfa-logo.svg" alt="AKFA VPN" />
+    </div>
+  );
 }
 
 function PublicConnectPage({ userToken }: { userToken: string }) {
@@ -229,7 +233,7 @@ function PublicConnectPage({ userToken }: { userToken: string }) {
       <main className="mx-auto grid max-w-5xl gap-6">
         <header className="flex flex-wrap items-center justify-between gap-3 border-b border-akfa-line pb-4">
           <div>
-            <div className="text-sm font-semibold text-akfa-red">AKFA VPN</div>
+            <img className="mb-2 h-8 w-auto object-contain" src="/assets/akfa-logo.svg" alt="AKFA VPN" />
             <h1 className="text-2xl font-semibold">Выберите устройство</h1>
             {data ? <p className="mt-1 text-sm text-akfa-muted">{data.display_name}</p> : null}
           </div>
@@ -377,9 +381,8 @@ function LoginPage({
       <Card className="w-full max-w-md">
         <CardHeader>
           <div className="flex items-center gap-3">
-            <div className="grid h-10 w-10 place-items-center rounded-md bg-akfa-red text-lg font-bold text-white">A</div>
+            <img className="h-8 w-auto shrink-0 object-contain" src="/assets/akfa-logo.svg" alt="AKFA VPN" />
             <div>
-              <h1 className="text-xl font-semibold">AKFA</h1>
               <div className="text-sm text-akfa-muted">Вход администратора</div>
             </div>
           </div>
@@ -1123,36 +1126,40 @@ function ServersPage({
               action={<Button onClick={onAdd}><Plus size={16} />Добавить VPS</Button>}
             />
           ) : (
-            <Table>
-              <thead>
-                <tr className="border-b border-akfa-line text-akfa-muted">
-                  <th className="py-2">Название</th>
-                  <th>IP-адрес</th>
-                  <th>Локация</th>
-                  <th>Порт VLESS</th>
-                  <th>Статус</th>
-                  <th>Синхронизация</th>
-                  <th className="text-right">Действия</th>
-                </tr>
-              </thead>
-              <tbody>
-                {nodes.map((node) => (
-                  <tr key={node.id} className="border-b border-akfa-line last:border-0">
-                    <td className="py-3 font-medium">{node.name}</td>
-                    <td>{node.ip_address}</td>
-                    <td>{node.location || "-"}</td>
-                    <td>{node.vless_port}</td>
-                    <td><StatusBadge value={node.status} /></td>
-                    <td>{syncLabel(node)}</td>
-                    <td className="flex justify-end gap-2 py-2">
-                      <Button variant="secondary" onClick={() => onPreview(node.id)}><FileJson size={15} />Конфиг</Button>
-                      <Button variant="ghost" onClick={() => onSelect(node)}>Открыть</Button>
-                      <Button variant="danger" onClick={() => onDelete(node)}><Trash2 size={15} />Удалить</Button>
-                    </td>
+            <div className="max-w-full overflow-x-auto overscroll-x-contain">
+              <Table className="min-w-[920px] whitespace-nowrap">
+                <thead>
+                  <tr className="border-b border-akfa-line text-akfa-muted">
+                    <th className="py-2 pr-4">Название</th>
+                    <th className="pr-4">IP-адрес</th>
+                    <th className="pr-4">Локация</th>
+                    <th className="pr-4">Порт VLESS</th>
+                    <th className="pr-4">Статус</th>
+                    <th className="pr-4">Синхронизация</th>
+                    <th className="text-right">Действия</th>
                   </tr>
-                ))}
-              </tbody>
-            </Table>
+                </thead>
+                <tbody>
+                  {nodes.map((node) => (
+                    <tr key={node.id} className="border-b border-akfa-line last:border-0">
+                      <td className="max-w-[220px] truncate py-3 pr-4 font-medium" title={node.name}>{node.name}</td>
+                      <td className="pr-4 font-mono text-xs">{node.ip_address}</td>
+                      <td className="max-w-[180px] truncate pr-4" title={node.location || "-"}>{node.location || "-"}</td>
+                      <td className="pr-4">{node.vless_port}</td>
+                      <td className="pr-4"><StatusBadge value={node.status} /></td>
+                      <td className="pr-4">{syncLabel(node)}</td>
+                      <td className="py-2">
+                        <div className="flex justify-end gap-2">
+                          <Button variant="secondary" onClick={() => onPreview(node.id)}><FileJson size={15} />Конфиг</Button>
+                          <Button variant="ghost" onClick={() => onSelect(node)}>Открыть</Button>
+                          <Button variant="danger" onClick={() => onDelete(node)}><Trash2 size={15} />Удалить</Button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </Table>
+            </div>
           )}
         </CardContent>
       </Card>
@@ -4002,10 +4009,10 @@ function connectOptions(token: string) {
     {
       id: "windows-fclashx",
       title: "Windows",
-      client: "FClashX / Mihomo",
+      client: "FClashX",
       helpKey: "windows_fclashx_url" as const,
       path: `/sub/${token}?platform=windows&client=fclashx&format=clash`,
-      steps: ["Установите FClashX или Mihomo.", "Импортируйте ссылку подписки.", "Выберите профиль akfa vpn и подключитесь."]
+      steps: ["Установите FClashX.", "Импортируйте ссылку подписки.", "Выберите профиль akfa vpn и подключитесь."]
     },
     {
       id: "macos-fclashx",

@@ -59,8 +59,8 @@ export default function AdminLoginPage() {
     <div className="login-box">
       <form className="admin-card" onSubmit={tempToken ? submit2fa : submit}>
         <div className="brand" style={{ marginBottom: 24 }}>
-          <span className="brand-mark">A</span>
-          <span>AKFA Docs Admin</span>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img className="brand-logo admin-brand-logo" src="/assets/akfa-logo.svg" alt="AKFA VPN" />
         </div>
         {message ? <div className="message error">{message}</div> : null}
         {tempToken ? (

@@ -278,8 +278,8 @@ export function AdminDashboard({ adminEmail, csrf }: { adminEmail: string; csrf:
         <header className="admin-header">
           <div>
             <div className="brand">
-              <span className="brand-mark">A</span>
-              <span>AKFA Docs Admin</span>
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img className="brand-logo admin-brand-logo" src="/assets/akfa-logo.svg" alt="AKFA VPN" />
             </div>
             <p style={{ color: 'var(--muted)', marginBottom: 0 }}>{adminEmail}</p>
           </div>

@@ -15,7 +15,7 @@ AKFA VPN - административная панель для управлен
 - Device limit: HWID hard mode.
 - Один VPN user = несколько HWID devices.
 - Одно устройство = один UUID/client в Xray.
-- Подписки: raw VLESS, base64, Clash/Mihomo YAML, sing-box JSON.
+- Подписки: raw VLESS, base64, Clash YAML, sing-box JSON.
 - Nodes: `akfa_owned` и `imported_safe`.
 - Xray install: background job с polling, без долгого HTTP request.
 - Apply-config: safe, с backup, timeout и сохранением unknown clients в `imported_safe`.
@@ -689,7 +689,7 @@ iPhone / iPad / Happ:
 /sub/{user_token}?platform=iphone&client=happ&format=raw
 ```
 
-Windows / FClashX/Mihomo:
+Windows / FClashX:
 
 ```text
 /sub/{user_token}?platform=windows&client=fclashx&format=clash
@@ -809,7 +809,7 @@ GET /sub/{user_token}?format=base64
 
 Возвращает base64 от raw VLESS lines.
 
-### Clash/Mihomo
+### Clash
 
 ```text
 GET /sub/{user_token}?platform=windows&client=fclashx&format=clash
@@ -1254,7 +1254,7 @@ curl -i \
 403 Превышен лимит устройств
 ```
 
-### Проверка FClashX/Mihomo
+### Проверка FClashX
 
 ```bash
 curl -i \
@@ -1384,7 +1384,7 @@ npm run build
 - проверить imported_safe на существующем Xray;
 - проверить `/connect/{user_token}`;
 - проверить `x-hwid` на реальном клиенте;
-- проверить `format=clash` в FClashX/Mihomo;
+- проверить `format=clash` в FClashX;
 - проверить auto apply-config после создания device;
 - проверить Dashboard node traffic после сбора stats.
 
