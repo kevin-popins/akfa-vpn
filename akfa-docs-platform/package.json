@@ -1,0 +1,36 @@
+{
+  "name": "akfa-docs-platform",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev -H 0.0.0.0 -p 6876",
+    "build": "next build",
+    "start": "node server.js",
+    "seed": "node scripts/seed.mjs",
+    "package:deploy": "node scripts/check-deploy-platform.mjs && npm run build && node scripts/package-deploy.mjs",
+    "package:deploy:linux": "node scripts/package-deploy-linux.mjs"
+  },
+  "dependencies": {
+    "@types/qrcode": "^1.5.6",
+    "bcryptjs": "^3.0.2",
+    "better-sqlite3": "^12.4.6",
+    "gray-matter": "^4.0.3",
+    "lucide-react": "^0.556.0",
+    "marked": "^17.0.1",
+    "next": "^16.2.4",
+    "qrcode": "^1.5.4",
+    "react": "^19.2.1",
+    "react-dom": "^19.2.1",
+    "sanitize-html": "^2.17.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "@types/sanitize-html": "^2.16.0",
+    "typescript": "^5.9.3"
+  }
+}
