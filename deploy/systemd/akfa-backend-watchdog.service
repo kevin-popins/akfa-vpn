@@ -1,0 +1,9 @@
+[Unit]
+Description=AKFA backend watchdog check
+Wants=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/akfa/backend-watchdog.env
+ExecStart=/usr/local/bin/akfa-backend-watchdog check

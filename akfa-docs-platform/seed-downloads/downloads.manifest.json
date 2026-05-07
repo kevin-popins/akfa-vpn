@@ -1,0 +1,28 @@
+{
+  "downloads": [
+    {
+      "key": "happ-android",
+      "title": "Happ для Android",
+      "platform": "android",
+      "filename": "happ-android.apk",
+      "source": "Happ.apk",
+      "publicPath": "/downloads/happ-android.apk"
+    },
+    {
+      "key": "fclashx-windows",
+      "title": "FlClashX для Windows",
+      "platform": "windows",
+      "filename": "fclashx-windows.exe",
+      "source": "FlClashX-windows-amd64-setup.exe",
+      "publicPath": "/downloads/fclashx-windows.exe"
+    },
+    {
+      "key": "fclashx-macos",
+      "title": "FlClashX для macOS",
+      "platform": "macos",
+      "filename": "fclashx-macos.dmg",
+      "source": "FlClashX-macos-arm64.dmg",
+      "publicPath": "/downloads/fclashx-macos.dmg"
+    }
+  ]
+}

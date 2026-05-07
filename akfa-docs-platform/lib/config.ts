@@ -1,0 +1,22 @@
+import path from 'node:path';
+
+export const appConfig = {
+  siteUrl: process.env.SITE_URL || 'https://DOCS_DOMAIN',
+  dataDir: process.env.DATA_DIR || path.join(process.cwd(), 'data'),
+  uploadDir: path.join(process.env.DATA_DIR || path.join(process.cwd(), 'data'), 'uploads'),
+  downloadsDir: process.env.DOWNLOADS_DIR || path.join(process.env.DATA_DIR || path.join(process.cwd(), 'data'), 'downloads'),
+  dbPath: path.join(process.env.DATA_DIR || path.join(process.cwd(), 'data'), 'akfa-docs.sqlite'),
+  sessionSecret: process.env.SESSION_SECRET || 'dev-only-change-this-secret',
+  adminEmail: process.env.ADMIN_EMAIL || 'ADMIN_EMAIL',
+  adminPassword: process.env.ADMIN_PASSWORD || 'replace-with-generated-admin-password',
+  maxUploadBytes: Number(process.env.MAX_UPLOAD_MB || 5) * 1024 * 1024,
+  maxDownloadBytes: Number(process.env.MAX_DOWNLOAD_MB || 200) * 1024 * 1024,
+  allowedDownloadExtensions: (process.env.ALLOWED_DOWNLOAD_EXTENSIONS || 'apk,exe,dmg,zip,msi,pkg')
+    .split(',')
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean),
+};
+
+export function downloadUrl(fileName: string) {
+  return `${appConfig.siteUrl.replace(/\/$/, '')}/downloads/${fileName}`;
+}

@@ -1,0 +1,12 @@
+[Unit]
+Description=Run AKFA backend watchdog every minute
+
+[Timer]
+OnBootSec=30s
+OnCalendar=*:0/1
+AccuracySec=10s
+Unit=akfa-backend-watchdog.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

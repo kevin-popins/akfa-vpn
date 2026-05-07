@@ -1,0 +1,15 @@
+[Unit]
+Description=AKFA Docs Platform
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/akfa-docs-platform
+EnvironmentFile=/opt/akfa-docs-platform/.env
+ExecStart=/usr/bin/node /opt/akfa-docs-platform/server.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
