@@ -194,10 +194,22 @@ class NodeMetricsRead(BaseModel):
     disk_used_bytes: int | None = None
     disk_total_bytes: int | None = None
     disk_percent: float | None = None
+    vpn_traffic_upload_bytes: int = 0
+    vpn_traffic_download_bytes: int = 0
+    vpn_traffic_total_bytes: int = 0
+    vpn_traffic_source: str = "xray_stats"
     traffic_upload_bytes: int = 0
     traffic_download_bytes: int = 0
     traffic_total_bytes: int = 0
+    traffic_type: str = "vpn_xray"
     traffic_source: str = "node_traffic"
+    system_traffic_upload_bytes: int | None = None
+    system_traffic_download_bytes: int | None = None
+    system_traffic_total_bytes: int | None = None
+    system_traffic_source: str = "unavailable"
+    system_traffic_interface: str | None = None
+    system_traffic_available: bool = False
+    system_traffic_error: str | None = None
     last_checked_at: datetime | None = None
     errors: list[str] = Field(default_factory=list)
 

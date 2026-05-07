@@ -1008,6 +1008,7 @@ function DashboardPage({
     ["Онлайн", stats?.nodes_online ?? 0],
     ["Пользователи", stats?.users_total ?? 0]
   ];
+  const systemTraffic = systemTrafficSummary(nodeMetrics);
   return (
     <div className="grid gap-5">
       <PageHeader
@@ -1039,11 +1040,32 @@ function DashboardPage({
             <Button variant="secondary" onClick={() => setPage("servers")}>Серверы</Button>
           </div>
         </CardHeader>
-        <CardContent className="max-h-[520px] overflow-auto">
+        <CardContent className="max-h-[620px] overflow-auto">
           {!nodeMetrics.length ? (
             <EmptyPanel title="Серверы пока не добавлены" text="Добавьте VPS, чтобы увидеть метрики CPU, RAM, диска и traffic." />
           ) : (
             <div className="grid gap-3">
+              <div className="rounded-md border border-akfa-line bg-zinc-50 px-4 py-3">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <div className="font-semibold">Общий трафик VPS</div>
+                    <div className="mt-1 text-xs text-akfa-muted">Весь сетевой трафик серверов: VPN, Nginx, база знаний, downloads, SSH, apt/docker, certbot и другие процессы.</div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-2xl font-semibold">{systemTraffic.available ? formatBytes(systemTraffic.total) : "нет данных"}</div>
+                    <div className="text-xs text-akfa-muted">{systemTraffic.sourceLabel}</div>
+                  </div>
+                </div>
+                {systemTraffic.available ? (
+                  <div className="mt-3 grid gap-2 text-sm md:grid-cols-3">
+                    <div><span className="text-akfa-muted">Upload</span><div className="font-medium">{formatBytes(systemTraffic.upload)}</div></div>
+                    <div><span className="text-akfa-muted">Download</span><div className="font-medium">{formatBytes(systemTraffic.download)}</div></div>
+                    <div><span className="text-akfa-muted">Интерфейсы</span><div className="font-medium">{systemTraffic.interfaces}</div></div>
+                  </div>
+                ) : (
+                  <Message tone="warning" text="Не удалось получить общий трафик VPS. Проверьте SSH-доступ к ноде." />
+                )}
+              </div>
               {nodeMetrics.map((metric) => <ServerMetricRow key={metric.node_id} metric={metric} />)}
             </div>
           )}
@@ -1079,6 +1101,21 @@ function DashboardPage({
   );
 }
 
+function systemTrafficSummary(metrics: NodeMetric[]) {
+  const available = metrics.filter((metric) => metric.system_traffic_available);
+  const upload = available.reduce((sum, metric) => sum + (metric.system_traffic_upload_bytes ?? 0), 0);
+  const download = available.reduce((sum, metric) => sum + (metric.system_traffic_download_bytes ?? 0), 0);
+  const interfaces = Array.from(new Set(available.map((metric) => metric.system_traffic_interface).filter(Boolean))).join(", ");
+  return {
+    available: available.length > 0,
+    upload,
+    download,
+    total: upload + download,
+    interfaces: interfaces || "/proc/net/dev",
+    sourceLabel: available.length > 0 ? "Источник: системный сетевой интерфейс (/proc/net/dev)" : "Источник: недоступен"
+  };
+}
+
 function ServerMetricRow({ metric }: { metric: NodeMetric }) {
   return (
     <div className="rounded-md border border-akfa-line bg-white px-4 py-3">
@@ -1102,15 +1139,45 @@ function ServerMetricRow({ metric }: { metric: NodeMetric }) {
           detail={metric.disk_used_bytes && metric.disk_total_bytes ? `${formatBytes(metric.disk_used_bytes)} / ${formatBytes(metric.disk_total_bytes)}` : undefined}
         />
       </div>
-      <div className="mt-3 grid gap-2 rounded-md bg-zinc-50 px-3 py-2 text-sm md:grid-cols-4">
-        <div><span className="text-akfa-muted">Upload</span><div className="font-medium">{formatBytes(metric.traffic_upload_bytes)}</div></div>
-        <div><span className="text-akfa-muted">Download</span><div className="font-medium">{formatBytes(metric.traffic_download_bytes)}</div></div>
-        <div><span className="text-akfa-muted">Total</span><div className="font-medium">{formatBytes(metric.traffic_total_bytes)}</div></div>
-        <div><span className="text-akfa-muted">Источник</span><div className="font-medium">{metric.traffic_source === "xray_inbound" ? "Xray node stats" : "Node traffic"}</div></div>
+      <div className="mt-3 grid gap-3 text-sm xl:grid-cols-2">
+        <div className="rounded-md bg-zinc-50 px-3 py-2">
+          <div className="font-semibold">Сетевой трафик сервера</div>
+          <div className="mt-1 text-xs text-akfa-muted">Весь сетевой трафик интерфейса сервера с момента загрузки счётчиков.</div>
+          <div className="mt-3 grid gap-2 md:grid-cols-4">
+            <div><span className="text-akfa-muted">Upload</span><div className="font-medium">{formatMetricBytes(metric.system_traffic_upload_bytes)}</div></div>
+            <div><span className="text-akfa-muted">Download</span><div className="font-medium">{formatMetricBytes(metric.system_traffic_download_bytes)}</div></div>
+            <div><span className="text-akfa-muted">Total</span><div className="font-medium">{formatMetricBytes(metric.system_traffic_total_bytes)}</div></div>
+            <div><span className="text-akfa-muted">Источник</span><div className="font-medium">{systemTrafficSourceLabel(metric)}</div></div>
+          </div>
+          {!metric.system_traffic_available ? <div className="mt-2 text-xs text-akfa-red">{metric.system_traffic_error || "Не удалось получить общий трафик VPS. Проверьте SSH-доступ к ноде."}</div> : null}
+        </div>
+        <div className="rounded-md bg-zinc-50 px-3 py-2">
+          <div className="font-semibold">VPN-трафик через Xray</div>
+          <div className="mt-1 text-xs text-akfa-muted">Только VPN/proxy-трафик, который прошёл через Xray inbound на этой ноде.</div>
+          <div className="mt-3 grid gap-2 md:grid-cols-4">
+            <div><span className="text-akfa-muted">Upload</span><div className="font-medium">{formatBytes(metric.vpn_traffic_upload_bytes)}</div></div>
+            <div><span className="text-akfa-muted">Download</span><div className="font-medium">{formatBytes(metric.vpn_traffic_download_bytes)}</div></div>
+            <div><span className="text-akfa-muted">Total</span><div className="font-medium">{formatBytes(metric.vpn_traffic_total_bytes)}</div></div>
+            <div><span className="text-akfa-muted">Источник</span><div className="font-medium">{vpnTrafficSourceLabel(metric.traffic_source)}</div></div>
+          </div>
+        </div>
       </div>
       {metric.errors.length ? <div className="mt-2 text-xs text-akfa-red">{metric.errors.join("; ")}</div> : null}
     </div>
   );
+}
+
+function vpnTrafficSourceLabel(source: NodeMetric["traffic_source"]) {
+  return source === "xray_inbound" ? "Xray inbound counters" : "Сохранённые Xray deltas";
+}
+
+function formatMetricBytes(value?: number | null) {
+  return typeof value === "number" ? formatBytes(value) : "нет данных";
+}
+
+function systemTrafficSourceLabel(metric: NodeMetric) {
+  if (metric.system_traffic_source !== "host_proc_net_dev") return "нет данных";
+  return metric.system_traffic_interface ? `/proc/net/dev: ${metric.system_traffic_interface}` : "/proc/net/dev";
 }
 
 function MetricBar({ label, value, detail }: { label: string; value?: number | null; detail?: string }) {
@@ -3117,7 +3184,7 @@ function TrafficPage({ nodes, rows, onRows }: { nodes: NodeRead[]; rows: Traffic
     <div className="grid gap-5">
       <PageHeader
         title="Аналитика трафика"
-        description="Снимки отправленного и полученного трафика, а также ручной сбор статистики с Xray API."
+        description="VPN-трафик пользователей: per-user, per-device и per-node статистика из Xray stats."
         action={
           <div className="flex flex-wrap gap-2">
             <Button variant="ghost" onClick={resetSort}>Сбросить сортировку</Button>
@@ -3127,6 +3194,7 @@ function TrafficPage({ nodes, rows, onRows }: { nodes: NodeRead[]; rows: Traffic
       />
       <Card>
         <CardContent className="grid gap-4">
+          <Message tone="info" text="Источник: Xray stats. Этот раздел не показывает общий сетевой трафик VPS." />
           {message ? <Message tone={message.includes("Не удалось") || message.includes("не обновились") ? "error" : "warning"} text={message} /> : null}
           {!message && zeroTraffic ? <Message tone="warning" text="Пользователи найдены, статистика пока 0 Б" /> : null}
           <div className="max-w-sm">
@@ -3515,13 +3583,14 @@ function EmptyPanel({ title, text, action }: { title: string; text: string; acti
   );
 }
 
-function Message({ tone, text }: { tone: "success" | "error" | "warning"; text: string }) {
+function Message({ tone, text }: { tone: "success" | "error" | "warning" | "info"; text: string }) {
   const classes = {
     success: "border-green-200 bg-green-50 text-akfa-green",
     error: "border-red-200 bg-red-50 text-akfa-red",
-    warning: "border-amber-200 bg-amber-50 text-amber-800"
+    warning: "border-amber-200 bg-amber-50 text-amber-800",
+    info: "border-blue-200 bg-blue-50 text-blue-800"
   };
-  const Icon = tone === "success" ? CheckCircle2 : tone === "error" ? AlertTriangle : AlertTriangle;
+  const Icon = tone === "success" ? CheckCircle2 : tone === "error" || tone === "warning" ? AlertTriangle : ShieldCheck;
   return (
     <div className={`flex items-start gap-2 rounded-md border px-3 py-2 text-sm ${classes[tone]}`}>
       <Icon className="mt-0.5 shrink-0" size={16} />

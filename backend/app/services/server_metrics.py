@@ -15,7 +15,9 @@ INBOUND_TRAFFIC_RE = re.compile(r"inbound>>>([^>]+)>>>traffic>>>(uplink|downlink
 CPU_SAMPLE_COMMAND = "cat /proc/stat; echo AKFA_CPU_SAMPLE; sleep 0.2; cat /proc/stat"
 RAM_COMMAND = "free -b"
 DISK_COMMAND = "df -B1 /"
+NETWORK_COMMAND = "ip route show default 2>/dev/null | awk 'NR==1 {for (i=1;i<=NF;i++) if ($i==\"dev\") {print $(i+1); exit}}'; echo AKFA_NET_DEV; cat /proc/net/dev"
 IGNORED_INBOUND_TAGS = {"api-in", "api"}
+IGNORED_NETWORK_INTERFACES = ("lo", "docker", "br-", "veth", "virbr", "zt", "tailscale")
 
 
 async def collect_nodes_metrics(db: Session, nodes: list[VpsNode], period: str = "all") -> list[dict[str, Any]]:
@@ -36,6 +38,9 @@ async def collect_node_metrics(db: Session, node: VpsNode, period: str = "all") 
         cpu_percent = parse_cpu_percent(command_outputs.get("cpu", ""))
         ram = parse_free_output(command_outputs.get("ram", ""))
         disk = parse_df_output(command_outputs.get("disk", ""))
+        network = parse_system_network_stats(command_outputs.get("network", ""))
+        if command_outputs.get("network_error"):
+            network = unavailable_system_network_stats(command_outputs["network_error"])
         inbound_raw = parse_inbound_stats(command_outputs.get("xray", ""))
         collected_at = datetime.now(timezone.utc)
         if inbound_raw["upload"] > 0 or inbound_raw["download"] > 0:
@@ -50,10 +55,16 @@ async def collect_node_metrics(db: Session, node: VpsNode, period: str = "all") 
                 "cpu_percent": cpu_percent,
                 **ram,
                 **disk,
+                "vpn_traffic_upload_bytes": traffic["upload"],
+                "vpn_traffic_download_bytes": traffic["download"],
+                "vpn_traffic_total_bytes": traffic["total"],
+                "vpn_traffic_source": "xray_stats",
                 "traffic_upload_bytes": traffic["upload"],
                 "traffic_download_bytes": traffic["download"],
                 "traffic_total_bytes": traffic["total"],
+                "traffic_type": "vpn_xray",
                 "traffic_source": traffic_source,
+                **network,
                 "last_checked_at": node.last_metrics_collected_at,
             }
         )
@@ -78,6 +89,7 @@ async def run_node_metric_commands(node: VpsNode) -> dict[str, str]:
             "cpu": CPU_SAMPLE_COMMAND,
             "ram": RAM_COMMAND,
             "disk": DISK_COMMAND,
+            "network": NETWORK_COMMAND,
             "xray": XRAY_STATS_COMMAND,
         }.items():
             result = await conn.run(command, check=False)
@@ -103,10 +115,22 @@ def base_metric_row(db: Session, node: VpsNode, period: str = "all") -> dict[str
         "disk_used_bytes": None,
         "disk_total_bytes": None,
         "disk_percent": None,
+        "vpn_traffic_upload_bytes": traffic["upload"],
+        "vpn_traffic_download_bytes": traffic["download"],
+        "vpn_traffic_total_bytes": traffic["total"],
+        "vpn_traffic_source": "xray_stats",
         "traffic_upload_bytes": traffic["upload"],
         "traffic_download_bytes": traffic["download"],
         "traffic_total_bytes": traffic["total"],
+        "traffic_type": "vpn_xray",
         "traffic_source": "node_traffic",
+        "system_traffic_upload_bytes": None,
+        "system_traffic_download_bytes": None,
+        "system_traffic_total_bytes": None,
+        "system_traffic_source": "unavailable",
+        "system_traffic_interface": None,
+        "system_traffic_available": False,
+        "system_traffic_error": "Нода не online" if node.status != NodeStatus.online.value else None,
         "last_checked_at": node.last_metrics_collected_at,
         "errors": [],
     }
@@ -156,6 +180,58 @@ def parse_df_output(output: str) -> dict[str, int | float | None]:
     used = int(parts[2])
     percent = round((used / total) * 100, 1) if total else 0.0
     return {"disk_total_bytes": total, "disk_used_bytes": used, "disk_percent": percent}
+
+
+def parse_system_network_stats(output: str) -> dict[str, int | str | bool | None]:
+    default_iface = None
+    proc_output = output
+    if "AKFA_NET_DEV" in output:
+        before, proc_output = output.split("AKFA_NET_DEV", 1)
+        default_iface = before.strip().splitlines()[-1].strip() if before.strip() else None
+    interfaces: dict[str, dict[str, int]] = {}
+    for line in proc_output.splitlines():
+        if ":" not in line:
+            continue
+        name, values = line.split(":", 1)
+        iface = name.strip()
+        parts = values.split()
+        if len(parts) < 16:
+            continue
+        interfaces[iface] = {"download": int(parts[0]), "upload": int(parts[8])}
+    selected = default_iface if default_iface in interfaces else None
+    if selected is None:
+        candidates = [
+            iface
+            for iface in interfaces
+            if not any(iface == ignored or iface.startswith(ignored) for ignored in IGNORED_NETWORK_INTERFACES)
+        ]
+        if len(candidates) == 1:
+            selected = candidates[0]
+    if selected is None:
+        return unavailable_system_network_stats("Не удалось определить сетевой интерфейс VPS")
+    download = interfaces[selected]["download"]
+    upload = interfaces[selected]["upload"]
+    return {
+        "system_traffic_upload_bytes": upload,
+        "system_traffic_download_bytes": download,
+        "system_traffic_total_bytes": upload + download,
+        "system_traffic_source": "host_proc_net_dev",
+        "system_traffic_interface": selected,
+        "system_traffic_available": True,
+        "system_traffic_error": None,
+    }
+
+
+def unavailable_system_network_stats(error: str | None = None) -> dict[str, int | str | bool | None]:
+    return {
+        "system_traffic_upload_bytes": None,
+        "system_traffic_download_bytes": None,
+        "system_traffic_total_bytes": None,
+        "system_traffic_source": "unavailable",
+        "system_traffic_interface": None,
+        "system_traffic_available": False,
+        "system_traffic_error": error or "Не удалось получить общий трафик VPS",
+    }
 
 
 def parse_inbound_stats(output: str) -> dict[str, int]:

@@ -9,6 +9,7 @@ from app.services.server_metrics import (
     parse_df_output,
     parse_free_output,
     parse_inbound_stats,
+    parse_system_network_stats,
 )
 
 
@@ -22,11 +23,27 @@ def test_server_metrics_parsers_parse_free_df_cpu_and_xray_stats():
     )
     free = "              total        used        free\nMem:     1000000000   625000000   375000000\n"
     df = "Filesystem     1B-blocks       Used Available Use% Mounted on\n/dev/vda1     2000000000  500000000 1500000000  25% /\n"
+    net = """eth0
+AKFA_NET_DEV
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 100 1 0 0 0 0 0 0 100 1 0 0 0 0 0 0
+  eth0: 2048 2 0 0 0 0 0 0 4096 3 0 0 0 0 0 0
+"""
     xray = '{"stat":[{"name":"inbound>>>vless-reality>>>traffic>>>uplink","value":100},{"name":"inbound>>>vless-reality>>>traffic>>>downlink","value":300},{"name":"inbound>>>api-in>>>traffic>>>uplink","value":999}]}'
 
     assert parse_cpu_percent(cpu) == 50.0
     assert parse_free_output(free) == {"ram_total_bytes": 1000000000, "ram_used_bytes": 625000000, "ram_percent": 62.5}
     assert parse_df_output(df) == {"disk_total_bytes": 2000000000, "disk_used_bytes": 500000000, "disk_percent": 25.0}
+    assert parse_system_network_stats(net) == {
+        "system_traffic_upload_bytes": 4096,
+        "system_traffic_download_bytes": 2048,
+        "system_traffic_total_bytes": 6144,
+        "system_traffic_source": "host_proc_net_dev",
+        "system_traffic_interface": "eth0",
+        "system_traffic_available": True,
+        "system_traffic_error": None,
+    }
     assert parse_inbound_stats(xray) == {"upload": 100, "download": 300}
 
 
@@ -74,8 +91,13 @@ def test_node_traffic_snapshots_are_server_level_and_periodic(db_session):
     assert aggregate_node_traffic(db_session, node.id, "all") == {"upload": 110, "download": 270, "total": 380}
     assert aggregate_node_traffic(db_session, node.id, "7d") == {"upload": 100, "download": 250, "total": 350}
     row = base_metric_row(db_session, node, "all")
+    assert row["traffic_type"] == "vpn_xray"
     assert row["traffic_source"] == "node_traffic"
+    assert row["vpn_traffic_source"] == "xray_stats"
+    assert row["vpn_traffic_total_bytes"] == 380
     assert row["traffic_total_bytes"] == 380
+    assert row["system_traffic_source"] == "unavailable"
+    assert row["system_traffic_available"] is False
 
 
 def test_background_collect_does_not_create_audit_entry(client, auth_headers, db_session):

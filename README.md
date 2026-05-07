@@ -924,7 +924,25 @@ AKFA 🇳🇱 Нидерланды 2
 
 ## Dashboard traffic по серверам
 
-В блоке Dashboard `Данные по серверам` трафик считается как server-level accounting.
+В Dashboard основная traffic-метрика — общий сетевой трафик VPS:
+
+- `Общий сетевой трафик VPS` — counters сетевого интерфейса VPS из `/proc/net/dev`.
+- `VPN-трафик через Xray` показывается рядом как отдельная диагностическая метрика.
+
+Эти метрики нельзя сравнивать как одно и то же: `/proc/net/dev` включает весь сетевой трафик сервера, включая VPN, Nginx, downloads, SSH, certbot, apt/docker и другие процессы. Xray показывает только VPN/proxy traffic.
+
+### Общий сетевой трафик VPS
+
+Для общего VPS traffic backend подключается к node по SSH и читает:
+
+- default interface через `ip route show default`;
+- counters из `/proc/net/dev`.
+
+Dashboard показывает upload/download/total для выбранного интерфейса с момента загрузки counters интерфейса. Эта метрика не строится из user stats и не заменяется Xray traffic, если системные counters недоступны.
+
+### VPN-трафик через Xray
+
+В блоке `VPN-трафик через Xray` трафик считается как server-level Xray accounting.
 
 Важно:
 
@@ -948,10 +966,10 @@ AKFA 🇳🇱 Нидерланды 2
 - Этот месяц;
 - Всё время.
 
-Источник на Dashboard:
+Источник VPN-трафика на Dashboard:
 
-- `Xray node stats`, если использованы inbound/node counters;
-- `Node traffic`, если отображаются сохраненные deltas.
+- `Xray inbound counters`, если при текущем сборе прочитаны inbound counters;
+- `Сохранённые Xray deltas`, если отображаются уже сохраненные deltas.
 
 `Users sum` больше не используется для server cards.
 
