@@ -16,10 +16,19 @@
 **/node_modules/
 **/dist/
 **/build/
+**/.next/
 **/.vite/
 **/.cache/
 **/coverage/
 **/tsconfig.tsbuildinfo
+**/data/
+**/uploads/
+**/*.sqlite
+**/*.db
+**/*.sql
+**/*.dump
+**/*.tar.gz
+**/*.backup.tar.gz
 
 *.log
 npm-debug.log*

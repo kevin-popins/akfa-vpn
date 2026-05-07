@@ -144,7 +144,7 @@ docker compose up -d
 Создайте администратора:
 
 ```bash
-docker compose exec -T backend python -m app.cli seed-admin --email admin@example.com --password 'ChangeMe123!'
+docker compose exec -T backend python -m app.cli seed-admin --email ADMIN_EMAIL --password 'GENERATED_ADMIN_PASSWORD'
 ```
 
 Проверка:
@@ -188,12 +188,15 @@ docker compose exec -T frontend npm run build
 
 ```env
 ENVIRONMENT=production
-DATABASE_URL=postgresql+psycopg://akfa:akfa@postgres:5432/akfa
+POSTGRES_DB=akfa
+POSTGRES_USER=akfa
+POSTGRES_PASSWORD=replace-with-generated-db-password
+DATABASE_URL=postgresql+psycopg://akfa:replace-with-generated-db-password@postgres:5432/akfa
 SESSION_SECRET=replace-with-at-least-32-random-characters
 ENCRYPTION_KEY=replace-with-a-fernet-key-from-python-cryptography
-CORS_ORIGINS=["http://localhost:8080"]
-SECURE_COOKIES=false
-SUBSCRIPTION_BASE_URL=http://localhost:8080
+CORS_ORIGINS=["https://PANEL_DOMAIN","https://PUBLIC_CONNECT_DOMAIN"]
+SECURE_COOKIES=true
+SUBSCRIPTION_BASE_URL=https://PUBLIC_CONNECT_DOMAIN
 ```
 
 Назначение:
@@ -201,6 +204,9 @@ SUBSCRIPTION_BASE_URL=http://localhost:8080
 | Переменная | Назначение |
 | --- | --- |
 | `ENVIRONMENT` | Режим окружения. Для production используйте `production`. |
+| `POSTGRES_DB` | Имя PostgreSQL database внутри compose. |
+| `POSTGRES_USER` | PostgreSQL user внутри compose. |
+| `POSTGRES_PASSWORD` | Сгенерированный пароль PostgreSQL. |
 | `DATABASE_URL` | DSN PostgreSQL для SQLAlchemy/psycopg. |
 | `SESSION_SECRET` | Секрет подписи cookie-session и временных auth tokens. |
 | `ENCRYPTION_KEY` | Fernet key для SSH-паролей и private keys. |
@@ -225,13 +231,13 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 Создать администратора:
 
 ```bash
-docker compose exec -T backend python -m app.cli seed-admin --email admin@example.com --password 'ChangeMe123!'
+docker compose exec -T backend python -m app.cli seed-admin --email ADMIN_EMAIL --password 'GENERATED_ADMIN_PASSWORD'
 ```
 
 Создать администратора с TOTP:
 
 ```bash
-docker compose exec -T backend python -m app.cli seed-admin --email admin@example.com --password 'ChangeMe123!' --enable-totp
+docker compose exec -T backend python -m app.cli seed-admin --email ADMIN_EMAIL --password 'GENERATED_ADMIN_PASSWORD' --enable-totp
 ```
 
 Flow входа:
@@ -829,7 +835,7 @@ YAML:
 proxies:
   - name: "AKFA 🇳🇱 Нидерланды"
     type: vless
-    server: "104.171.140.37"
+    server: "SERVER_IP"
     port: 443
     uuid: "<device.uuid>"
     network: tcp
@@ -1061,19 +1067,19 @@ Create/update user показывает process popup:
 Seed admin:
 
 ```bash
-python -m app.cli seed-admin --email admin@example.com --password 'ChangeMe123!'
+python -m app.cli seed-admin --email ADMIN_EMAIL --password 'GENERATED_ADMIN_PASSWORD'
 ```
 
 Seed admin with TOTP:
 
 ```bash
-python -m app.cli seed-admin --email admin@example.com --password 'ChangeMe123!' --enable-totp
+python -m app.cli seed-admin --email ADMIN_EMAIL --password 'GENERATED_ADMIN_PASSWORD' --enable-totp
 ```
 
 Через Docker:
 
 ```bash
-docker compose exec -T backend python -m app.cli seed-admin --email admin@example.com --password 'ChangeMe123!'
+docker compose exec -T backend python -m app.cli seed-admin --email ADMIN_EMAIL --password 'GENERATED_ADMIN_PASSWORD'
 ```
 
 ## API map
@@ -1388,6 +1394,134 @@ npm run build
 - проверить auto apply-config после создания device;
 - проверить Dashboard node traffic после сбора stats.
 
+## v0.1 VPS operations
+
+Все production-шаблоны используют placeholders:
+
+- `PANEL_DOMAIN`;
+- `PUBLIC_CONNECT_DOMAIN`;
+- `DOCS_DOMAIN`;
+- `SERVER_IP`;
+- `ADMIN_EMAIL`.
+
+Не храните реальные домены, IP, пароли, токены, private keys, cookies и backup archives в git.
+
+### One-command install flow
+
+На чистом Ubuntu VPS после публикации репозитория на GitHub:
+
+```bash
+sudo GIT_REPO=https://github.com/ORG/REPO.git \
+  PANEL_DOMAIN=panel.example.com \
+  PUBLIC_CONNECT_DOMAIN=connect.example.com \
+  DOCS_DOMAIN=help.example.com \
+  ADMIN_EMAIL=ADMIN_EMAIL \
+  SSL_EMAIL=ADMIN_EMAIL \
+  bash -c "$(curl -fsSL https://raw.githubusercontent.com/ORG/REPO/main/scripts/install.sh)"
+```
+
+Если не хотите pipe-to-shell, используйте ручной flow ниже.
+
+### Manual install flow
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git
+sudo git clone https://github.com/ORG/REPO.git /opt/akfa-vpn
+cd /opt/akfa-vpn
+sudo PANEL_DOMAIN=panel.example.com \
+  PUBLIC_CONNECT_DOMAIN=connect.example.com \
+  DOCS_DOMAIN=help.example.com \
+  ADMIN_EMAIL=ADMIN_EMAIL \
+  scripts/install.sh
+```
+
+Installer:
+
+- устанавливает Docker, docker compose plugin, nginx, certbot;
+- генерирует `.env` с новыми `POSTGRES_PASSWORD`, `SESSION_SECRET`, `ENCRYPTION_KEY`;
+- не перезаписывает существующий `.env` без подтверждения;
+- поднимает `docker compose`;
+- создаёт initial admin через `ADMIN_EMAIL` и временный сгенерированный пароль;
+- ставит backend watchdog timer;
+- рендерит nginx templates из `deploy/nginx/`;
+- опционально выпускает TLS через certbot.
+
+### Update
+
+Перед первым обновлением старого VPS убедитесь, что `/opt/akfa-vpn/.env` содержит `POSTGRES_PASSWORD`, а пароль в `DATABASE_URL` совпадает с ним. Новый `docker-compose.yml` специально не использует fallback-пароль для production.
+
+```bash
+cd /opt/akfa-vpn
+sudo scripts/update.sh
+```
+
+Update script сначала запускает backup, затем делает `git pull --ff-only`, пересобирает `backend` и `frontend`, не удаляет volumes и проверяет `/health`.
+
+### Backup
+
+```bash
+sudo /opt/akfa-vpn/scripts/backup.sh
+```
+
+Backup складывается в `/opt/akfa-backups`, содержит PostgreSQL dump, `.env`, `docker-compose.yml` и deploy templates. Ротация по умолчанию: 14 дней.
+
+### Doctor
+
+```bash
+sudo /opt/akfa-vpn/scripts/doctor.sh
+```
+
+Doctor показывает `docker compose ps`, backend health, frontend status, `nginx -t`, disk space, статус backend watchdog и последние backend/watchdog logs.
+
+## Backend self-healing
+
+Production self-healing реализован через systemd timer:
+
+- script: `scripts/backend-watchdog.sh`;
+- service: `deploy/systemd/akfa-backend-watchdog.service`;
+- timer: `deploy/systemd/akfa-backend-watchdog.timer`;
+- env template: `deploy/systemd/backend-watchdog.env.example`.
+
+Поведение:
+
+- раз в минуту выполняется bounded check `HEALTH_URL`, по умолчанию `http://127.0.0.1:8000/health`;
+- `curl` ограничен `CONNECT_TIMEOUT` и `MAX_TIME`;
+- один сбой не рестартит backend;
+- restart выполняется только после `FAIL_THRESHOLD` последовательных сбоев, по умолчанию 3;
+- есть cooldown между рестартами;
+- рестартует только docker compose service `backend`;
+- не удаляет контейнеры, volumes, PostgreSQL data или backups;
+- пишет лог в `/var/log/akfa-backend-watchdog.log` и syslog.
+
+Команды:
+
+```bash
+sudo systemctl status akfa-backend-watchdog.timer
+sudo /usr/local/bin/akfa-backend-watchdog status
+sudo journalctl -u akfa-backend-watchdog.service -n 100 --no-pager
+```
+
+## Nginx maintenance fallback
+
+Шаблоны:
+
+- panel nginx: `deploy/nginx/panel.conf`;
+- docs nginx: `deploy/nginx/docs.conf`;
+- static fallback page: `deploy/static/maintenance.html`.
+
+`panel.conf` проксирует в frontend upstream `127.0.0.1:8080` и показывает `/maintenance.html` для `502/503/504`. Maintenance page отдаётся с `Cache-Control: no-store`.
+
+Если frontend загрузился, но backend API недоступен, React UI показывает собственный экран:
+
+```text
+Панель временно перезапускается
+Выполняется автоматическое восстановление сервиса.
+Обновите страницу через 1–2 минуты.
+```
+
+HTTP `401/403` остаются обычной auth-логикой и не считаются maintenance.
+
 ## Troubleshooting
 
 ### `403 Ваш клиент не поддерживает ограничение устройств`
@@ -1467,11 +1601,20 @@ docker compose logs --tail=200 backend
 - SSH passwords/private keys шифруются Fernet key.
 - `.env` нельзя коммитить.
 - Production cookies должны быть secure.
+- `SESSION_SECRET`, `ENCRYPTION_KEY`, `POSTGRES_PASSWORD` должны генерироваться отдельно для каждого VPS.
+- `CORS_ORIGINS` в production должен содержать только `https://PANEL_DOMAIN` и при необходимости `https://PUBLIC_CONNECT_DOMAIN`.
+- Admin session cookie `httpOnly`; CSRF cookie не `httpOnly`, потому что frontend отправляет его в `X-CSRF-Token`.
+- Admin write endpoints требуют auth и CSRF.
+- Upload/import endpoints ограничивают тип и размер файлов.
+- Markdown/HTML в базе знаний проходит sanitization перед `dangerouslySetInnerHTML`.
+- Nginx templates запрещают отдачу `.env`, `.git`, dumps, backups, SQLite DB и logs.
 - Admin panel лучше закрывать firewall.
 - TOTP желательно включить всем администраторам.
 - Backup archive содержит sensitive данные.
 - Xray API не должен быть доступен извне.
 - В `imported_safe` unknown clients сохраняются.
+
+Практический hardening не является обещанием абсолютной безопасности. Перед production рекомендуется отдельный security review инфраструктуры, firewall, SSH-доступов, TLS и backup storage.
 
 ## Git hygiene
 
@@ -1484,6 +1627,10 @@ docker compose logs --tail=200 backend
 - `__pycache__/`;
 - `.pytest_cache/`;
 - временные backup archives;
+- PostgreSQL dumps;
+- SQLite DB/data/uploads;
+- TLS private keys/certificates;
+- `.next/`, `dist/`, `build/`;
 - локальные IDE/cache files.
 
 Полезно перед коммитом:
@@ -1492,3 +1639,4 @@ docker compose logs --tail=200 backend
 git status --short
 git diff --stat
 ```
+

@@ -97,6 +97,8 @@ public_router = APIRouter(tags=["subscriptions"])
 ModelT = TypeVar("ModelT")
 logger = logging.getLogger(__name__)
 IDEMPOTENCY_TTL_SECONDS = 300
+MAX_CSV_IMPORT_BYTES = 2 * 1024 * 1024
+MAX_BACKUP_IMPORT_BYTES = 50 * 1024 * 1024
 _create_user_idempotency_cache: dict[str, dict[str, Any]] = {}
 _create_user_idempotency_locks: dict[str, asyncio.Lock] = {}
 PUBLIC_HELP_LINK_KEYS = (
@@ -1267,7 +1269,13 @@ async def reset_user_devices(user_id: int, admin: Admin = Depends(require_write)
 
 @router.post("/users/import", response_model=BulkImportResult)
 async def import_users(file: UploadFile, admin: Admin = Depends(require_write), db: Session = Depends(get_db)) -> BulkImportResult:
-    text = (await file.read()).decode("utf-8-sig")
+    filename = file.filename or ""
+    if filename and not filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=422, detail="Загрузите CSV-файл")
+    raw = await file.read()
+    if len(raw) > MAX_CSV_IMPORT_BYTES:
+        raise HTTPException(status_code=413, detail="CSV-файл слишком большой")
+    text = raw.decode("utf-8-sig")
     rows = csv.DictReader(io.StringIO(text))
     created: list[VpnUser] = []
     errors: list[str] = []
@@ -1411,6 +1419,8 @@ async def import_backup(file: UploadFile, admin: Admin = Depends(require_write),
     if not filename.endswith(".tar.gz"):
         raise HTTPException(status_code=422, detail="Загрузите архив .tar.gz")
     raw = await file.read()
+    if len(raw) > MAX_BACKUP_IMPORT_BYTES:
+        raise HTTPException(status_code=413, detail="Архив бэкапа слишком большой")
     try:
         restored = restore_backup_archive(db, raw)
     except ValueError as exc:

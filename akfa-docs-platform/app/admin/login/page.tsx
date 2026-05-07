@@ -3,7 +3,7 @@
 import { useState } from 'react';
 
 export default function AdminLoginPage() {
-  const [email, setEmail] = useState('admin@example.com');
+  const [email, setEmail] = useState('ADMIN_EMAIL');
   const [password, setPassword] = useState('');
   const [code, setCode] = useState('');
   const [tempToken, setTempToken] = useState('');

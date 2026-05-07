@@ -64,18 +64,12 @@ nano /opt/akfa-docs-platform/.env
 NODE_ENV=production
 HOSTNAME=127.0.0.1
 PORT=6876
-SITE_URL=https://help.kevinrobertson.ru
+SITE_URL=https://DOCS_DOMAIN
 DATA_DIR=/opt/akfa-docs-platform/data
-SESSION_SECRET=long-random-secret
-ADMIN_EMAIL=your-admin@example.com
-ADMIN_PASSWORD=strong-password
+SESSION_SECRET=replace-with-generated-secret
+ADMIN_EMAIL=ADMIN_EMAIL
+ADMIN_PASSWORD=replace-with-generated-admin-password
 MAX_UPLOAD_MB=5
-```
-
-Production:
-
-```text
-SITE_URL=https://help.akfa.ru
 ```
 
 ## 4. Проверить ручной запуск
@@ -112,20 +106,10 @@ systemctl status akfa-docs-platform
 
 ## 6. Nginx
 
-Тестовый домен:
-
 ```bash
-cp /opt/akfa-docs-platform/deploy/nginx-help.kevinrobertson.ru.conf /etc/nginx/sites-available/help.kevinrobertson.ru
-ln -s /etc/nginx/sites-available/help.kevinrobertson.ru /etc/nginx/sites-enabled/help.kevinrobertson.ru
-nginx -t
-systemctl reload nginx
-```
-
-Production домен:
-
-```bash
-cp /opt/akfa-docs-platform/deploy/nginx-help.akfa.ru.conf /etc/nginx/sites-available/help.akfa.ru
-ln -s /etc/nginx/sites-available/help.akfa.ru /etc/nginx/sites-enabled/help.akfa.ru
+export DOCS_DOMAIN=help.example.com
+sed "s/DOCS_DOMAIN/$DOCS_DOMAIN/g" /opt/akfa-docs-platform/deploy/nginx-docs.conf > /etc/nginx/sites-available/akfa-docs.conf
+ln -s /etc/nginx/sites-available/akfa-docs.conf /etc/nginx/sites-enabled/akfa-docs.conf
 nginx -t
 systemctl reload nginx
 ```

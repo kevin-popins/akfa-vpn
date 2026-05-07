@@ -297,16 +297,39 @@ export type TrafficCollectResult = {
   message: string;
 };
 
+const API_TIMEOUT_MS = 12000;
+
+export class ApiMaintenanceError extends Error {
+  constructor(message = "Панель временно перезапускается") {
+    super(message);
+    this.name = "ApiMaintenanceError";
+  }
+}
+
+export function isApiMaintenanceError(error: unknown): error is ApiMaintenanceError {
+  return error instanceof ApiMaintenanceError;
+}
+
+function notifyMaintenance() {
+  window.dispatchEvent(new CustomEvent("akfa:maintenance"));
+}
+
 let csrfToken = localStorage.getItem("akfa_csrf") || "";
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const isFormData = options.body instanceof FormData;
-  const { headers: optionHeaders, ...fetchOptions } = options;
+  const { headers: optionHeaders, signal: optionSignal, ...fetchOptions } = options;
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  if (optionSignal) {
+    optionSignal.addEventListener("abort", () => controller.abort(), { once: true });
+  }
   let response: Response;
   try {
     response = await fetch(path, {
       ...fetchOptions,
       credentials: "include",
+      signal: controller.signal,
       headers: {
         ...(isFormData ? {} : { "Content-Type": "application/json" }),
         ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
@@ -314,7 +337,14 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
       }
     });
   } catch (error) {
-    throw new Error("Не удалось связаться с сервером. Проверьте соединение и обновите страницу.");
+    notifyMaintenance();
+    throw new ApiMaintenanceError("Панель временно перезапускается");
+  } finally {
+    window.clearTimeout(timeout);
+  }
+  if ([502, 503, 504].includes(response.status)) {
+    notifyMaintenance();
+    throw new ApiMaintenanceError("Панель временно перезапускается");
   }
   if (!response.ok) {
     const text = await response.text();
@@ -522,12 +552,22 @@ export const api = {
     return request<BulkImportResult>("/admin/users/import", { method: "POST", body });
   },
   async exportBackup() {
-    const response = await fetch("/admin/backup/export", {
-      credentials: "include",
-      headers: {
-        ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {})
-      }
-    });
+    let response: Response;
+    try {
+      response = await fetch("/admin/backup/export", {
+        credentials: "include",
+        headers: {
+          ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {})
+        }
+      });
+    } catch {
+      notifyMaintenance();
+      throw new ApiMaintenanceError("Панель временно перезапускается");
+    }
+    if ([502, 503, 504].includes(response.status)) {
+      notifyMaintenance();
+      throw new ApiMaintenanceError("Панель временно перезапускается");
+    }
     if (!response.ok) throw new Error(await response.text() || `HTTP ${response.status}`);
     const disposition = response.headers.get("Content-Disposition") || "";
     const filename = disposition.match(/filename="([^"]+)"/)?.[1] || "akfa-backup.tar.gz";

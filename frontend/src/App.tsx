@@ -27,7 +27,7 @@ import { Button } from "./components/ui/button";
 import { Card, CardContent, CardHeader } from "./components/ui/card";
 import { Field, Input, Select, Textarea } from "./components/ui/input";
 import { StatusBadge, Table } from "./components/ui/table";
-import { api, type AccessProfile, type ConfigApplySummary, type DashboardStats, type Department, type NodeMetric, type NodeRead, type PublicConnect, type PublicHelpLinks, type SniCheckResult, type SshCheckResult, type SubscriptionVlessUri, type TrafficUser, type VpnUser, type VpnUserDevice, type XrayProbeResult } from "./lib/api";
+import { api, isApiMaintenanceError, type AccessProfile, type ConfigApplySummary, type DashboardStats, type Department, type NodeMetric, type NodeRead, type PublicConnect, type PublicHelpLinks, type SniCheckResult, type SshCheckResult, type SubscriptionVlessUri, type TrafficUser, type VpnUser, type VpnUserDevice, type XrayProbeResult } from "./lib/api";
 import { formatBytes } from "./lib/utils";
 
 type SessionState = "checking" | "login" | "totp" | "setup" | "ready";
@@ -107,19 +107,33 @@ const defaultPublicHelpLinks: PublicHelpLinks = {
 
 function App() {
   const [session, setSession] = useState<SessionState>("checking");
+  const [maintenance, setMaintenance] = useState(false);
   const [page, setPage] = useState<PageKey>("dashboard");
   const [notice, setNotice] = useState("");
   const publicToken = publicConnectToken();
 
   useEffect(() => {
     if (publicToken) return;
+    const onMaintenance = () => setMaintenance(true);
+    window.addEventListener("akfa:maintenance", onMaintenance);
     api
       .me()
-      .then(() => setSession("ready"))
-      .catch(() => setSession("login"));
+      .then(() => {
+        setMaintenance(false);
+        setSession("ready");
+      })
+      .catch((error) => {
+        if (isApiMaintenanceError(error)) {
+          setMaintenance(true);
+          return;
+        }
+        setSession("login");
+      });
+    return () => window.removeEventListener("akfa:maintenance", onMaintenance);
   }, [publicToken]);
 
   if (publicToken) return <PublicConnectPage userToken={publicToken} />;
+  if (maintenance) return <MaintenanceScreen />;
   if (session === "checking") return <Splash />;
   if (session === "login" || session === "totp" || session === "setup") {
     return (
@@ -138,6 +152,30 @@ function App() {
     <Layout page={page} onPage={setPage}>
       <AdminPages page={page} setPage={setPage} />
     </Layout>
+  );
+}
+
+function MaintenanceScreen() {
+  return (
+    <div className="grid min-h-screen place-items-center bg-akfa-soft px-4">
+      <Card className="w-full max-w-lg text-center">
+        <CardHeader>
+          <img className="mx-auto h-10 w-auto object-contain" src="/assets/akfa-logo.svg" alt="AKFA VPN" />
+        </CardHeader>
+        <CardContent className="grid gap-4">
+          <div>
+            <h1 className="text-2xl font-semibold">Панель временно перезапускается</h1>
+            <p className="mt-2 text-sm leading-6 text-akfa-muted">
+              Выполняется автоматическое восстановление сервиса. Обновите страницу через 1–2 минуты.
+            </p>
+          </div>
+          <Button onClick={() => window.location.reload()}>
+            <RefreshCcw size={16} />
+            Обновить страницу
+          </Button>
+        </CardContent>
+      </Card>
+    </div>
   );
 }
 
@@ -335,7 +373,7 @@ function LoginPage({
   onNotice: (value: string) => void;
   notice: string;
 }) {
-  const [email, setEmail] = useState("admin@example.com");
+  const [email, setEmail] = useState("ADMIN_EMAIL");
   const [password, setPassword] = useState("");
   const [code, setCode] = useState("");
   const [loginToken, setLoginToken] = useState("");

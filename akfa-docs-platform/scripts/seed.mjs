@@ -5,8 +5,8 @@ import bcrypt from 'bcryptjs';
 
 const dataDir = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const dbPath = path.join(dataDir, 'akfa-docs.sqlite');
-const email = process.env.ADMIN_EMAIL || 'admin@example.com';
-const password = process.env.ADMIN_PASSWORD || 'ChangeMe123!';
+const email = process.env.ADMIN_EMAIL || 'ADMIN_EMAIL';
+const password = process.env.ADMIN_PASSWORD || 'replace-with-generated-admin-password';
 
 fs.mkdirSync(dataDir, { recursive: true });
 const db = new Database(dbPath);

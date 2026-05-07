@@ -63,8 +63,8 @@ dist/akfa-docs-platform-deploy.tar.gz
 По умолчанию:
 
 ```text
-admin@example.com
-ChangeMe123!
+ADMIN_EMAIL
+replace-with-generated-admin-password
 ```
 
 Перед production запуском обязательно задайте свои значения в `.env`:
