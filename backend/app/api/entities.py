@@ -80,6 +80,7 @@ from app.services.config_apply import (
     affected_node_ids_for_user,
     apply_config_for_user,
 )
+from app.services.connect_messages import build_connect_messages_csv
 from app.services.server_metrics import collect_nodes_metrics
 from app.services.ssh_installer import XrayInstaller
 from app.services.hwid import apply_device_metadata, build_display_name, compute_hwid_context
@@ -378,6 +379,25 @@ def request_idempotency_key(request: Request) -> str | None:
     if not value:
         return None
     return value[:120]
+
+
+def parse_csv_ids(value: str | None) -> list[int] | None:
+    if not value:
+        return None
+    ids: list[int] = []
+    for raw_item in value.split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+        try:
+            parsed = int(item)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="ids должен быть списком чисел через запятую") from exc
+        if parsed <= 0:
+            raise HTTPException(status_code=422, detail="ids должен содержать положительные числа")
+        if parsed not in ids:
+            ids.append(parsed)
+    return ids
 
 
 def cached_created_user(db: Session, key: str) -> VpnUser | None:
@@ -1051,6 +1071,25 @@ async def create_user_unlocked(
             summary.skipped,
         )
     return attach_apply_status(user, summary)
+
+
+@router.get("/users/export-connect-messages")
+def export_connect_messages(
+    ids: str | None = None,
+    _: Admin = Depends(current_admin),
+    db: Session = Depends(get_db),
+) -> Response:
+    selected_ids = parse_csv_ids(ids)
+    query = select(VpnUser).where(VpnUser.status != UserStatus.deleted.value)
+    if selected_ids is not None:
+        query = query.where(VpnUser.id.in_(selected_ids))
+    users = list(db.scalars(query.order_by(VpnUser.created_at.desc())))
+    content = build_connect_messages_csv(users)
+    return Response(
+        content=content,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="akfa-connect-messages.csv"'},
+    )
 
 
 @router.get("/users/{user_id}", response_model=VpnUserRead)

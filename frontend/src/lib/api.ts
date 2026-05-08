@@ -421,6 +421,29 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   }
 }
 
+async function downloadRequest(path: string, defaultFilename: string) {
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      credentials: "include",
+      headers: {
+        ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {})
+      }
+    });
+  } catch {
+    notifyMaintenance();
+    throw new ApiMaintenanceError("Панель временно перезапускается");
+  }
+  if ([502, 503, 504].includes(response.status)) {
+    notifyMaintenance();
+    throw new ApiMaintenanceError("Панель временно перезапускается");
+  }
+  if (!response.ok) throw new Error(await response.text() || `HTTP ${response.status}`);
+  const disposition = response.headers.get("Content-Disposition") || "";
+  const filename = disposition.match(/filename="([^"]+)"/)?.[1] || defaultFilename;
+  return { blob: await response.blob(), filename };
+}
+
 export const api = {
   setCsrf(token: string) {
     csrfToken = token;
@@ -587,26 +610,11 @@ export const api = {
     return request<BulkImportResult>("/admin/users/import", { method: "POST", body });
   },
   async exportBackup() {
-    let response: Response;
-    try {
-      response = await fetch("/admin/backup/export", {
-        credentials: "include",
-        headers: {
-          ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {})
-        }
-      });
-    } catch {
-      notifyMaintenance();
-      throw new ApiMaintenanceError("Панель временно перезапускается");
-    }
-    if ([502, 503, 504].includes(response.status)) {
-      notifyMaintenance();
-      throw new ApiMaintenanceError("Панель временно перезапускается");
-    }
-    if (!response.ok) throw new Error(await response.text() || `HTTP ${response.status}`);
-    const disposition = response.headers.get("Content-Disposition") || "";
-    const filename = disposition.match(/filename="([^"]+)"/)?.[1] || "akfa-backup.tar.gz";
-    return { blob: await response.blob(), filename };
+    return downloadRequest("/admin/backup/export", "akfa-backup.tar.gz");
+  },
+  exportConnectMessages(ids?: number[]) {
+    const query = ids?.length ? `?ids=${encodeURIComponent(ids.join(","))}` : "";
+    return downloadRequest(`/admin/users/export-connect-messages${query}`, "akfa-connect-messages.csv");
   },
   importBackup(file: File) {
     const body = new FormData();

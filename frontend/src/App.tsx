@@ -28,7 +28,7 @@ import { Card, CardContent, CardHeader } from "./components/ui/card";
 import { Field, Input, Select, Textarea } from "./components/ui/input";
 import { StatusBadge, Table } from "./components/ui/table";
 import { api, isApiMaintenanceError, type AccessProfile, type ConfigApplySummary, type DashboardStats, type Department, type NodeMetric, type NodeRead, type PublicConnect, type PublicHelpLinks, type SniCheckResult, type SshCheckResult, type SubscriptionVlessUri, type TrafficUser, type VpnUser, type VpnUserDevice, type XrayProbeResult } from "./lib/api";
-import { formatBytes } from "./lib/utils";
+import { buildConnectMessage, formatBytes } from "./lib/utils";
 
 type SessionState = "checking" | "login" | "totp" | "setup" | "ready";
 type NodeAction = "check" | "dry-run" | "install" | "verify" | "apply-config";
@@ -2205,6 +2205,7 @@ function UsersPage({
   const [departmentFilter, setDepartmentFilter] = useState("");
   const [grouped, setGrouped] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [exportingMessages, setExportingMessages] = useState(false);
   const [operation, setOperation] = useState<OperationState>(null);
   const createInFlightRef = useRef(false);
   const activeNodeIds = useMemo(() => nodes.filter((node) => node.status === "online").map((node) => node.id), [nodes]);
@@ -2283,6 +2284,24 @@ function UsersPage({
       setCreating(false);
     }
   }
+
+  async function downloadConnectMessages() {
+    setExportingMessages(true);
+    try {
+      const { blob, filename } = await api.exportConnectMessages();
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = filename;
+      link.click();
+      URL.revokeObjectURL(link.href);
+      onNotice("Файл сообщений скачан");
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "Не удалось скачать сообщения");
+    } finally {
+      setExportingMessages(false);
+    }
+  }
+
   const visibleUserRows = visibleUsers(users);
   const filteredUsers = visibleUserRows.filter((user) => {
     const haystack = `${user.first_name} ${user.last_name} ${user.username} ${departmentName(user.department_id, departments)}`.toLowerCase();
@@ -2302,6 +2321,10 @@ function UsersPage({
             <h2 className="font-semibold">Список пользователей</h2>
             <div className="mt-0.5 text-xs text-akfa-muted">Показано {filteredUsers.length} из {visibleUserRows.length}</div>
           </div>
+          <Button variant="secondary" onClick={downloadConnectMessages} disabled={exportingMessages || !visibleUserRows.length}>
+            <Download size={16} />
+            {exportingMessages ? "Готовлю CSV..." : "Скачать сообщения"}
+          </Button>
         </CardHeader>
         <CardContent className="grid gap-3 px-4 py-3">
           <div className="grid min-w-0 items-center gap-2 lg:grid-cols-[minmax(220px,1fr)_150px_180px_auto]">
@@ -2568,6 +2591,7 @@ function UserDetailPage({
   const [operation, setOperation] = useState<OperationState>(null);
   const [activeTab, setActiveTab] = useState("Ссылка подписки");
   const [confirm, setConfirm] = useState<ConfirmState>(null);
+  const [messageCopied, setMessageCopied] = useState(false);
 
   useEffect(() => {
     if (!user) {
@@ -2575,9 +2599,11 @@ function UserDetailPage({
       setVlessEntries([]);
       setDevices([]);
       setEditForm(defaultUserForm);
+      setMessageCopied(false);
       return;
     }
     setEditForm(userFormFromUser(user));
+    setMessageCopied(false);
     setNodeSelection({ ids: user.allowed_node_ids || [], primaryId: user.primary_node_id || null });
     const connectUrl = absoluteUrl(`/connect/${user.subscription_token}`);
     setAccessBlocks([{ label: "Connect-ссылка", value: connectUrl }]);
@@ -2607,6 +2633,7 @@ function UserDetailPage({
   const userId = user.id;
   const currentTab = activeTab === "QR-код" ? null : accessBlocks.find((block) => block.label === activeTab) || accessBlocks[0];
   const qrValue = subscriptionUrl;
+  const connectMessage = buildConnectMessage(user, subscriptionUrl);
 
   async function action(actionName: "enable" | "disable" | "regenerate-uuid" | "regenerate-subscription" | "reset-traffic", message: string) {
     try {
@@ -2632,6 +2659,13 @@ function UserDetailPage({
   async function copyLink() {
     await navigator.clipboard.writeText(subscriptionUrl);
     onNotice("Ссылка подписки скопирована");
+  }
+
+  async function copyConnectMessage() {
+    await navigator.clipboard.writeText(connectMessage);
+    setMessageCopied(true);
+    window.setTimeout(() => setMessageCopied(false), 1800);
+    onNotice("Скопировано");
   }
 
   async function revokeDevice(deviceId: number) {
@@ -2778,6 +2812,21 @@ function UserDetailPage({
               ) : null}
             </>
           ) : null}
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="font-semibold">Сообщение для пользователя</h2>
+            <p className="mt-1 text-xs text-akfa-muted">Скопируйте это сообщение и отправьте пользователю. Так он сможет подключиться к AKFA VPN.</p>
+          </div>
+          <Button variant="secondary" onClick={copyConnectMessage}>
+            <Copy size={16} />
+            {messageCopied ? "Скопировано" : "Скопировать сообщение"}
+          </Button>
+        </CardHeader>
+        <CardContent>
+          <Textarea readOnly className="min-h-[180px] resize-y leading-relaxed" value={connectMessage} />
         </CardContent>
       </Card>
       <Card>

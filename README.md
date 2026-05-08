@@ -1050,6 +1050,8 @@ Audit фиксирует критичные admin actions:
 - online status;
 - traffic summary;
 - connect link;
+- ready-to-send user message for connect link;
+- CSV export of connect messages;
 - QR connect link;
 - user detail;
 - edit user settings;
