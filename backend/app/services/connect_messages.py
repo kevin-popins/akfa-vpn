@@ -5,7 +5,7 @@ from typing import Any
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
-from openpyxl.worksheet.table import Table, TableStyleInfo
+
 
 from app.core.config import settings
 
@@ -121,15 +121,7 @@ def build_connect_messages_xlsx(users: Sequence[Any], base_url: str | None = Non
     worksheet.freeze_panes = "A2"
     worksheet.auto_filter.ref = worksheet.dimensions
     if worksheet.max_row >= 1:
-        table = Table(displayName="ConnectMessages", ref=worksheet.dimensions)
-        table.tableStyleInfo = TableStyleInfo(
-            name="TableStyleMedium2",
-            showFirstColumn=False,
-            showLastColumn=False,
-            showRowStripes=True,
-            showColumnStripes=False,
-        )
-        worksheet.add_table(table)
+        worksheet.auto_filter.ref = worksheet.dimensions
 
     output = io.BytesIO()
     workbook.save(output)
