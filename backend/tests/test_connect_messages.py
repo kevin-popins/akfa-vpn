@@ -2,9 +2,12 @@ import csv
 import io
 from types import SimpleNamespace
 
+from openpyxl import load_workbook
+
 from app.core.config import settings
 from app.services.connect_messages import (
     CONNECT_MESSAGE_CSV_COLUMNS,
+    CONNECT_MESSAGE_XLSX_CONTENT_TYPE,
     build_connect_message,
 )
 
@@ -34,7 +37,7 @@ def test_export_connect_messages_requires_admin_auth(client):
     assert response.status_code == 401
 
 
-def test_export_connect_messages_csv_contains_columns_link_and_bom(client, auth_headers):
+def test_export_connect_messages_xlsx_contains_columns_link_and_single_message_cell(client, auth_headers):
     old_base_url = settings.subscription_base_url
     settings.subscription_base_url = "https://panel.example.test"
     try:
@@ -49,21 +52,49 @@ def test_export_connect_messages_csv_contains_columns_link_and_bom(client, auth_
         response = client.get("/admin/users/export-connect-messages", headers=auth_headers)
 
         assert response.status_code == 200
-        assert response.headers["content-type"].startswith("text/csv")
-        assert response.headers["content-disposition"] == 'attachment; filename="akfa-connect-messages.csv"'
-        assert response.content.startswith(b"\xef\xbb\xbf")
+        assert response.headers["content-type"].startswith(CONNECT_MESSAGE_XLSX_CONTENT_TYPE)
+        assert response.headers["content-disposition"] == 'attachment; filename="akfa-connect-messages.xlsx"'
 
-        text = response.content.decode("utf-8-sig")
-        rows = list(csv.DictReader(io.StringIO(text)))
-        assert rows
-        assert list(rows[0].keys()) == list(CONNECT_MESSAGE_CSV_COLUMNS)
-        row = next(item for item in rows if item["Логин"] == "ivan.petrov")
         connect_link = f"https://panel.example.test/connect/{token}"
-        assert row["Connect-ссылка"] == connect_link
-        assert row["Готовое сообщение"].startswith("Уважаемый/ая Петров Иван!")
-        assert connect_link in row["Готовое сообщение"]
+        workbook = load_workbook(io.BytesIO(response.content))
+        worksheet = workbook.active
+        headers = [cell.value for cell in worksheet[1]]
+        assert headers == list(CONNECT_MESSAGE_CSV_COLUMNS)
+        assert worksheet.freeze_panes == "A2"
+        assert worksheet.auto_filter.ref == "A1:H2"
+
+        data_rows = list(worksheet.iter_rows(min_row=2, values_only=True))
+        assert len(data_rows) == 1
+        row = data_rows[0]
+        assert row[2] == "ivan.petrov"
+        assert row[6] == connect_link
+        assert row[7].startswith("Уважаемый/ая Петров Иван!")
+        assert "\n\nЭто ваша ссылка" in row[7]
+        assert connect_link in row[7]
+        assert worksheet["H2"].alignment.wrap_text is True
+        assert worksheet["G2"].hyperlink.target == connect_link
     finally:
         settings.subscription_base_url = old_base_url
+
+
+def test_export_connect_messages_csv_fallback_contains_bom_and_semicolon(client, auth_headers):
+    created = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={"first_name": "Иван", "last_name": "Петров", "username": "ivan.petrov"},
+    )
+    assert created.status_code == 200
+
+    response = client.get("/admin/users/export-connect-messages?format=csv", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/csv")
+    assert response.headers["content-disposition"] == 'attachment; filename="akfa-connect-messages.csv"'
+    assert response.content.startswith(b"\xef\xbb\xbf")
+    text = response.content.decode("utf-8-sig")
+    rows = list(csv.DictReader(io.StringIO(text), delimiter=";"))
+    assert list(rows[0].keys()) == list(CONNECT_MESSAGE_CSV_COLUMNS)
+    assert rows[0]["Логин"] == "ivan.petrov"
 
 
 def test_export_connect_messages_can_filter_by_ids(client, auth_headers):
@@ -86,5 +117,6 @@ def test_export_connect_messages_can_filter_by_ids(client, auth_headers):
     )
 
     assert response.status_code == 200
-    rows = list(csv.DictReader(io.StringIO(response.content.decode("utf-8-sig"))))
-    assert [row["Логин"] for row in rows] == ["oleg.smirnov"]
+    workbook = load_workbook(io.BytesIO(response.content))
+    rows = list(workbook.active.iter_rows(min_row=2, values_only=True))
+    assert [row[2] for row in rows] == ["oleg.smirnov"]

@@ -80,7 +80,11 @@ from app.services.config_apply import (
     affected_node_ids_for_user,
     apply_config_for_user,
 )
-from app.services.connect_messages import build_connect_messages_csv
+from app.services.connect_messages import (
+    CONNECT_MESSAGE_XLSX_CONTENT_TYPE,
+    build_connect_messages_csv,
+    build_connect_messages_xlsx,
+)
 from app.services.server_metrics import collect_nodes_metrics
 from app.services.ssh_installer import XrayInstaller
 from app.services.hwid import apply_device_metadata, build_display_name, compute_hwid_context
@@ -1076,6 +1080,7 @@ async def create_user_unlocked(
 @router.get("/users/export-connect-messages")
 def export_connect_messages(
     ids: str | None = None,
+    format: str = "xlsx",
     _: Admin = Depends(current_admin),
     db: Session = Depends(get_db),
 ) -> Response:
@@ -1084,11 +1089,21 @@ def export_connect_messages(
     if selected_ids is not None:
         query = query.where(VpnUser.id.in_(selected_ids))
     users = list(db.scalars(query.order_by(VpnUser.created_at.desc())))
-    content = build_connect_messages_csv(users)
+    export_format = format.strip().lower()
+    if export_format == "csv":
+        content = build_connect_messages_csv(users)
+        return Response(
+            content=content,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="akfa-connect-messages.csv"'},
+        )
+    if export_format not in {"", "xlsx"}:
+        raise HTTPException(status_code=422, detail="format должен быть xlsx или csv")
+    content = build_connect_messages_xlsx(users)
     return Response(
         content=content,
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": 'attachment; filename="akfa-connect-messages.csv"'},
+        media_type=CONNECT_MESSAGE_XLSX_CONTENT_TYPE,
+        headers={"Content-Disposition": 'attachment; filename="akfa-connect-messages.xlsx"'},
     )
 
 

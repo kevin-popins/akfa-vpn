@@ -614,7 +614,7 @@ export const api = {
   },
   exportConnectMessages(ids?: number[]) {
     const query = ids?.length ? `?ids=${encodeURIComponent(ids.join(","))}` : "";
-    return downloadRequest(`/admin/users/export-connect-messages${query}`, "akfa-connect-messages.csv");
+    return downloadRequest(`/admin/users/export-connect-messages${query}`, "akfa-connect-messages.xlsx");
   },
   importBackup(file: File) {
     const body = new FormData();

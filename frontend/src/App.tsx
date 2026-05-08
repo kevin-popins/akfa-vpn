@@ -2323,7 +2323,7 @@ function UsersPage({
           </div>
           <Button variant="secondary" onClick={downloadConnectMessages} disabled={exportingMessages || !visibleUserRows.length}>
             <Download size={16} />
-            {exportingMessages ? "Готовлю CSV..." : "Скачать сообщения"}
+            {exportingMessages ? "Готовлю Excel..." : "Скачать сообщения .xlsx"}
           </Button>
         </CardHeader>
         <CardContent className="grid gap-3 px-4 py-3">
