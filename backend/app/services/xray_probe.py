@@ -5,9 +5,10 @@ from typing import Any
 
 import asyncssh
 
-from app.core.security import decrypt_secret, mask_secret
+from app.core.security import mask_secret
 from app.models import NodeManagedMode, NodeStatus, VpsNode
 from app.schemas.entities import XrayProbeResponse
+from app.services.ssh_host_keys import ssh_connection_options
 from app.services.ssh_installer import SSH_COMMAND_TIMEOUT_SECONDS, SSH_CONNECT_TIMEOUT_SECONDS
 
 
@@ -142,16 +143,11 @@ def import_probe_to_node(node: VpsNode, probe: XrayProbeResponse, public_key: st
 
 
 async def _connect(node: VpsNode) -> asyncssh.SSHClientConnection:
-    password = decrypt_secret(node.encrypted_ssh_password)
-    private_key = decrypt_secret(node.encrypted_private_key)
+    _, options = ssh_connection_options(node)
     return await asyncio.wait_for(
         asyncssh.connect(
             node.ip_address,
-            port=node.ssh_port,
-            username=node.ssh_username,
-            password=password,
-            client_keys=[asyncssh.import_private_key(private_key)] if private_key else None,
-            known_hosts=None,
+            **options,
         ),
         timeout=SSH_CONNECT_TIMEOUT_SECONDS,
     )

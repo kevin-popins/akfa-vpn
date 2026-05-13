@@ -120,6 +120,7 @@ class NodeUpdate(BaseModel):
 
 class NodeRead(NodeBase, OrmModel):
     id: int
+    ssh_host_key_fingerprint: str | None = None
     reality_public_key: str | None = None
     xray_installed: bool = False
     managed_mode: str = "akfa_owned"

@@ -7,8 +7,8 @@ import asyncssh
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.security import decrypt_secret
 from app.models import DeviceStatus, NodeStatus, TrafficSnapshot, UserNodeTraffic, UserStatus, VpsNode, VpnUser, VpnUserDevice
+from app.services.ssh_host_keys import ssh_connection_options
 
 USER_TRAFFIC_RE = re.compile(r"user>>>([^>]+)>>>traffic>>>(uplink|downlink)")
 DEVICE_EMAIL_RE = re.compile(r"^akfa_user_(\d+)_device_(\d+)$")
@@ -59,15 +59,10 @@ def select_traffic_nodes(nodes: list[VpsNode], selected_node_id: int | None = No
 
 
 async def run_xray_statsquery(node: VpsNode) -> dict[str, Any]:
-    password = decrypt_secret(node.encrypted_ssh_password)
-    private_key = decrypt_secret(node.encrypted_private_key)
+    _, options = ssh_connection_options(node)
     async with asyncssh.connect(
         node.ip_address,
-        port=node.ssh_port,
-        username=node.ssh_username,
-        password=password,
-        client_keys=[asyncssh.import_private_key(private_key)] if private_key else None,
-        known_hosts=None,
+        **options,
     ) as conn:
         result = await conn.run(XRAY_STATS_COMMAND, check=False)
     return {

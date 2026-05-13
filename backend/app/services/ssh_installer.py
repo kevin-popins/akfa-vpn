@@ -10,6 +10,7 @@ import asyncssh
 from app.core.security import decrypt_secret, mask_secret
 from app.models import VpsNode, VpnUser
 from app.services.reality import ensure_reality_credentials
+from app.services.ssh_host_keys import ssh_connection_options
 from app.services.xray_config import render_server_config
 
 
@@ -273,19 +274,19 @@ class XrayInstaller:
         )
 
     async def _connect(self) -> asyncssh.SSHClientConnection:
-        password = decrypt_secret(self.node.encrypted_ssh_password)
-        private_key = decrypt_secret(self.node.encrypted_private_key)
-        return await asyncio.wait_for(
+        verifier, options = ssh_connection_options(self.node)
+        conn = await asyncio.wait_for(
             asyncssh.connect(
                 self.node.ip_address,
-                port=self.node.ssh_port,
-                username=self.node.ssh_username,
-                password=password,
-                client_keys=[asyncssh.import_private_key(private_key)] if private_key else None,
-                known_hosts=None,
+                **options,
             ),
             timeout=SSH_CONNECT_TIMEOUT_SECONDS,
         )
+        if verifier.accepted_new:
+            self._log("info", None, f"SSH fingerprint сохранен: {verifier.fingerprint}", mutating=False)
+        elif verifier.matched_existing:
+            self._log("info", None, f"SSH fingerprint проверен: {verifier.fingerprint}", mutating=False)
+        return conn
 
     async def _exec(
         self,

@@ -1,5 +1,6 @@
 import pyotp
 
+from app.core.security import decrypt_secret
 from app.models import Admin
 
 
@@ -33,8 +34,10 @@ def test_totp_setup_start_does_not_enable_or_require_2fa(client, db_session):
     assert me_before_confirm.status_code == 200
     assert me_before_confirm.json()["totp_enabled"] is False
     admin = db_session.query(Admin).filter_by(email="admin@example.com").one()
-    assert admin.pending_totp_secret == start.json()["secret"]
+    assert admin.pending_totp_secret is None
+    assert decrypt_secret(admin.pending_totp_secret_encrypted) == start.json()["secret"]
     assert admin.totp_secret is None
+    assert admin.totp_secret_encrypted is None
     assert admin.totp_enabled is False
     assert admin.totp_confirmed_at is None
 
@@ -57,8 +60,10 @@ def test_totp_confirm_valid_code_enables_and_next_login_requires_2fa(client, db_
     assert me_after_confirm.status_code == 200
     assert me_after_confirm.json()["totp_enabled"] is True
     admin = db_session.query(Admin).filter_by(email="admin@example.com").one()
-    assert admin.totp_secret == secret
+    assert admin.totp_secret is None
+    assert decrypt_secret(admin.totp_secret_encrypted) == secret
     assert admin.pending_totp_secret is None
+    assert admin.pending_totp_secret_encrypted is None
     assert admin.totp_enabled is True
     assert admin.totp_confirmed_at is not None
 
@@ -73,14 +78,37 @@ def test_totp_confirm_valid_code_enables_and_next_login_requires_2fa(client, db_
     assert verify.json()["csrf_token"]
 
 
+def test_legacy_plain_totp_secret_is_encrypted_after_successful_verify(client, db_session):
+    secret = pyotp.random_base32()
+    admin = db_session.query(Admin).filter_by(email="admin@example.com").one()
+    admin.totp_secret = secret
+    admin.totp_secret_encrypted = None
+    admin.totp_enabled = True
+    admin.totp_confirmed_at = admin.created_at
+    db_session.commit()
+
+    login = client.post("/auth/login", json={"email": "admin@example.com", "password": "StrongPass123"})
+    assert login.status_code == 200
+    assert login.json()["requires_2fa"] is True
+
+    verify = client.post("/auth/2fa/verify", json={"login_token": login.json()["login_token"], "code": pyotp.TOTP(secret).now()})
+    assert verify.status_code == 200
+
+    db_session.refresh(admin)
+    assert admin.totp_secret is None
+    assert decrypt_secret(admin.totp_secret_encrypted) == secret
+
+
 def test_totp_confirm_invalid_code_keeps_pending_and_disabled(client, db_session):
     client.post("/auth/login", json={"email": "admin@example.com", "password": "StrongPass123"})
     secret = client.post("/auth/2fa/setup/start", json={}).json()["secret"]
     confirm = client.post("/auth/2fa/setup/confirm", json={"code": "000000"})
     assert confirm.status_code == 401
     admin = db_session.query(Admin).filter_by(email="admin@example.com").one()
-    assert admin.pending_totp_secret == secret
+    assert admin.pending_totp_secret is None
+    assert decrypt_secret(admin.pending_totp_secret_encrypted) == secret
     assert admin.totp_secret is None
+    assert admin.totp_secret_encrypted is None
     assert admin.totp_enabled is False
 
 
@@ -98,6 +126,8 @@ def test_totp_disable_clears_active_and_pending(client, db_session):
     admin = db_session.query(Admin).filter_by(email="admin@example.com").one()
     assert admin.totp_secret is None
     assert admin.pending_totp_secret is None
+    assert admin.totp_secret_encrypted is None
+    assert admin.pending_totp_secret_encrypted is None
     assert admin.totp_enabled is False
     assert admin.totp_confirmed_at is None
 
@@ -108,6 +138,8 @@ def test_repeated_totp_setup_start_replaces_pending_without_enabling(client, db_
     second = client.post("/auth/2fa/setup/start", json={}).json()["secret"]
     assert second != first
     admin = db_session.query(Admin).filter_by(email="admin@example.com").one()
-    assert admin.pending_totp_secret == second
+    assert admin.pending_totp_secret is None
+    assert decrypt_secret(admin.pending_totp_secret_encrypted) == second
     assert admin.totp_secret is None
+    assert admin.totp_secret_encrypted is None
     assert admin.totp_enabled is False

@@ -7,8 +7,8 @@ import asyncssh
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.core.security import decrypt_secret
 from app.models import NodeStatus, TrafficSnapshot, VpsNode
+from app.services.ssh_host_keys import ssh_connection_options
 from app.services.traffic import XRAY_STATS_COMMAND
 
 INBOUND_TRAFFIC_RE = re.compile(r"inbound>>>([^>]+)>>>traffic>>>(uplink|downlink)")
@@ -74,16 +74,11 @@ async def collect_node_metrics(db: Session, node: VpsNode, period: str = "all") 
 
 
 async def run_node_metric_commands(node: VpsNode) -> dict[str, str]:
-    password = decrypt_secret(node.encrypted_ssh_password)
-    private_key = decrypt_secret(node.encrypted_private_key)
+    _, options = ssh_connection_options(node)
     outputs: dict[str, str] = {}
     async with asyncssh.connect(
         node.ip_address,
-        port=node.ssh_port,
-        username=node.ssh_username,
-        password=password,
-        client_keys=[asyncssh.import_private_key(private_key)] if private_key else None,
-        known_hosts=None,
+        **options,
     ) as conn:
         for key, command in {
             "cpu": CPU_SAMPLE_COMMAND,

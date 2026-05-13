@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import select
 
-from app.core.security import hash_password, new_totp_secret
+from app.core.security import decrypt_secret, encrypt_secret, hash_password, new_totp_secret
 from app.db.session import SessionLocal
 from app.models import Admin, AdminRole
 from app.services.access_profiles import seed_default_access_profiles
@@ -19,7 +19,8 @@ def seed_admin(email: str, password: str, enable_totp: bool, reset_password: boo
                 admin.role = AdminRole.super_admin.value
                 admin.is_active = True
                 if enable_totp and not admin.totp_enabled:
-                    admin.totp_secret = new_totp_secret()
+                    admin.totp_secret = None
+                    admin.totp_secret_encrypted = encrypt_secret(new_totp_secret())
                     admin.totp_enabled = True
                     admin.totp_required = True
                     admin.totp_confirmed_at = datetime.now(timezone.utc)
@@ -29,11 +30,13 @@ def seed_admin(email: str, password: str, enable_totp: bool, reset_password: boo
             else:
                 print(f"Admin already exists: {email}")
             return
+        totp_secret = new_totp_secret() if enable_totp else None
         admin = Admin(
             email=email,
             password_hash=hash_password(password),
             role=AdminRole.super_admin.value,
-            totp_secret=new_totp_secret() if enable_totp else None,
+            totp_secret=None,
+            totp_secret_encrypted=encrypt_secret(totp_secret) if totp_secret else None,
             totp_enabled=enable_totp,
             totp_required=enable_totp,
             totp_confirmed_at=datetime.now(timezone.utc) if enable_totp else None,
@@ -42,8 +45,9 @@ def seed_admin(email: str, password: str, enable_totp: bool, reset_password: boo
         seed_default_access_profiles(db)
         db.commit()
         print(f"Created super admin: {email}")
-        if admin.totp_secret:
-            print(f"TOTP secret: {admin.totp_secret}")
+        secret = decrypt_secret(admin.totp_secret_encrypted)
+        if secret:
+            print(f"TOTP secret: {secret}")
     finally:
         db.close()
 

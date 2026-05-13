@@ -37,7 +37,7 @@ def new_totp_secret() -> str:
 
 def verify_totp(secret: str | None, code: str | None) -> bool:
     if not secret:
-        return True
+        return False
     if not code:
         return False
     return pyotp.TOTP(secret).verify(code, valid_window=1)

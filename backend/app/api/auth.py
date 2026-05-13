@@ -11,6 +11,8 @@ from app.core.security import (
     create_csrf_token,
     create_login_token,
     create_session,
+    decrypt_secret,
+    encrypt_secret,
     new_totp_secret,
     read_login_token,
     read_session,
@@ -35,8 +37,31 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 def _active_totp_secret(admin: Admin) -> str | None:
-    if admin.totp_enabled and admin.totp_confirmed_at and admin.totp_secret:
-        return admin.totp_secret
+    if admin.totp_enabled and admin.totp_confirmed_at:
+        if admin.totp_secret_encrypted:
+            return decrypt_secret(admin.totp_secret_encrypted)
+        if admin.totp_secret:
+            admin.totp_secret_encrypted = encrypt_secret(admin.totp_secret)
+            admin.totp_secret = None
+            return decrypt_secret(admin.totp_secret_encrypted)
+    return None
+
+
+def _has_active_totp(admin: Admin) -> bool:
+    return bool(
+        admin.totp_enabled
+        and admin.totp_confirmed_at
+        and (admin.totp_secret_encrypted or admin.totp_secret)
+    )
+
+
+def _pending_totp_secret(admin: Admin) -> str | None:
+    if admin.pending_totp_secret_encrypted:
+        return decrypt_secret(admin.pending_totp_secret_encrypted)
+    if admin.pending_totp_secret:
+        admin.pending_totp_secret_encrypted = encrypt_secret(admin.pending_totp_secret)
+        admin.pending_totp_secret = None
+        return decrypt_secret(admin.pending_totp_secret_encrypted)
     return None
 
 
@@ -88,7 +113,7 @@ def login(payload: LoginRequest, request: Request, response: Response, db: Sessi
     admin = db.scalar(select(Admin).where(Admin.email == payload.email))
     if not admin or not admin.is_active or not verify_password(payload.password, admin.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Неверный email или пароль")
-    if _active_totp_secret(admin):
+    if _has_active_totp(admin):
         return LoginResponse(requires_2fa=True, login_token=create_login_token(admin.id, "totp_verify"))
     if admin.totp_required:
         return LoginResponse(
@@ -144,9 +169,11 @@ def setup_start(
         target = _admin_from_login_token(db, payload.login_token, "totp_setup")
     if target is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Требуется вход")
-    target.pending_totp_secret = new_totp_secret()
+    pending_secret = new_totp_secret()
+    target.pending_totp_secret = None
+    target.pending_totp_secret_encrypted = encrypt_secret(pending_secret)
     db.commit()
-    return TotpSetupStartResponse(secret=target.pending_totp_secret, otpauth_url=totp_uri(target.pending_totp_secret, target.email))
+    return TotpSetupStartResponse(secret=pending_secret, otpauth_url=totp_uri(pending_secret, target.email))
 
 
 @router.post("/2fa/setup/confirm", response_model=LoginResponse)
@@ -159,10 +186,13 @@ def setup_confirm(
     admin = _admin_from_login_token(db, payload.login_token, "totp_setup") if payload.login_token else _admin_from_session(db, session_cookie)
     if admin is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Требуется вход")
-    if not verify_totp(admin.pending_totp_secret, payload.code):
+    pending_secret = _pending_totp_secret(admin)
+    if not verify_totp(pending_secret, payload.code):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Неверный код 2FA")
-    admin.totp_secret = admin.pending_totp_secret
+    admin.totp_secret = None
+    admin.totp_secret_encrypted = encrypt_secret(pending_secret)
     admin.pending_totp_secret = None
+    admin.pending_totp_secret_encrypted = None
     admin.totp_enabled = True
     admin.totp_required = False
     admin.totp_confirmed_at = datetime.now(timezone.utc)
@@ -176,6 +206,7 @@ def disable_2fa(payload: TotpDisableRequest, admin: Admin = Depends(require_writ
     admin.totp_secret = None
     admin.pending_totp_secret = None
     admin.totp_secret_encrypted = None
+    admin.pending_totp_secret_encrypted = None
     admin.totp_enabled = False
     admin.totp_required = False
     admin.totp_confirmed_at = None
