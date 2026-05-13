@@ -308,6 +308,34 @@ class PublicHelpLinks(BaseModel):
         return normalized
 
 
+class SubscriptionSettings(BaseModel):
+    title: str = Field(default="AKFA VPN", min_length=1, max_length=120)
+    filename: str = Field(default="akfa-vpn", min_length=1, max_length=80)
+    announcement: str = Field(default="", max_length=1200)
+    update_interval_hours: int = Field(default=12, ge=1, le=168)
+    server_prefix: str = Field(default="AKFA", min_length=1, max_length=48)
+
+    @field_validator("title", "filename", "server_prefix", mode="before")
+    @classmethod
+    def validate_required_text(cls, value: str) -> str:
+        normalized = str(value or "").strip()
+        if not normalized:
+            raise ValueError("Поле не может быть пустым")
+        return normalized
+
+    @field_validator("filename")
+    @classmethod
+    def validate_filename(cls, value: str) -> str:
+        if any(char in value for char in ["\\", "/", "\x00"]):
+            raise ValueError("Имя файла не должно содержать / или \\")
+        return value.strip(". ")
+
+    @field_validator("announcement", mode="before")
+    @classmethod
+    def validate_announcement(cls, value: str | None) -> str:
+        return str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
 class PublicConnectRead(BaseModel):
     display_name: str
     status: str

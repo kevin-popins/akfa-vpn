@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.models import (
     AccessProfile,
     Admin,
+    AppSetting,
     AuditLog,
     Department,
     TrafficSnapshot,
@@ -27,6 +28,7 @@ APP_NAME = "AKFA"
 
 EXPORT_MODELS = [
     Admin,
+    AppSetting,
     AccessProfile,
     Department,
     VpsNode,
@@ -40,6 +42,7 @@ EXPORT_MODELS = [
 
 EXPORT_FILES = {
     "admins": Admin,
+    "app_settings": AppSetting,
     "profiles": AccessProfile,
     "departments": Department,
     "nodes": VpsNode,

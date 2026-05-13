@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     access_cookie_name: str = "akfa_session"
     csrf_cookie_name: str = "akfa_csrf"
     subscription_base_url: str = "http://localhost:8000"
+    subscription_title: str = "AKFA VPN"
+    subscription_filename: str = "akfa-vpn"
+    subscription_announcement: str = ""
+    subscription_update_interval_hours: int = 12
+    subscription_server_prefix: str = "AKFA"
 
 
 @lru_cache

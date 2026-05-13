@@ -292,6 +292,14 @@ export type PublicHelpLinks = {
   macos_fclashx_url?: string | null;
 };
 
+export type SubscriptionSettings = {
+  title: string;
+  filename: string;
+  announcement: string;
+  update_interval_hours: number;
+  server_prefix: string;
+};
+
 export type TrafficCollectResult = {
   nodes_considered: Array<Record<string, unknown>>;
   selected_nodes: number[];
@@ -481,6 +489,12 @@ export const api = {
   },
   savePublicHelpLinks(payload: PublicHelpLinks) {
     return request<PublicHelpLinks>("/admin/settings/public-help-links", { method: "PUT", body: JSON.stringify(payload) });
+  },
+  subscriptionSettings() {
+    return request<SubscriptionSettings>("/admin/settings/subscription");
+  },
+  saveSubscriptionSettings(payload: SubscriptionSettings) {
+    return request<SubscriptionSettings>("/admin/settings/subscription", { method: "PUT", body: JSON.stringify(payload) });
   },
   nodes() {
     return request<NodeRead[]>("/admin/nodes");

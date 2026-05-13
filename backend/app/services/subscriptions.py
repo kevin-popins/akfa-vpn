@@ -9,6 +9,13 @@ from sqlalchemy.orm import Session
 
 from app.models import AccessProfile, DeviceStatus, UserStatus, VpsNode, VpnUser, VpnUserDevice
 from app.services.reality import ensure_reality_credentials
+from app.services.subscription_settings import (
+    absolute_connect_url,
+    happ_metadata_comments,
+    read_subscription_settings,
+    subscription_headers,
+    yaml_notice_comment,
+)
 from app.services.xray_config import (
     clean_server_names,
     ordered_available_nodes,
@@ -16,8 +23,6 @@ from app.services.xray_config import (
     render_xray_client_config_for_nodes,
     vless_uri,
 )
-
-PROFILE_TITLE = "akfa vpn"
 
 
 def validate_subscription_user(user: VpnUser | None) -> VpnUser:
@@ -59,7 +64,8 @@ def subscription_payload(db: Session, user: VpnUser, device: VpnUserDevice | Non
         xray_json = render_xray_client_config_for_nodes(nodes, user, user.access_profile, None)
         sing_box = render_sing_box_config_for_nodes(nodes, user, user.access_profile, None)
     else:
-        names = clean_server_names(nodes)
+        metadata = read_subscription_settings(db)
+        names = clean_server_names(nodes, metadata.server_prefix)
         raw_uris = [
             {
                 "node_id": node.id,
@@ -81,15 +87,21 @@ def subscription_payload(db: Session, user: VpnUser, device: VpnUserDevice | Non
     }
 
 
-def raw_subscription_text(db: Session, user: VpnUser, device: VpnUserDevice) -> str:
+def raw_subscription_text(db: Session, user: VpnUser, device: VpnUserDevice, *, include_happ_metadata: bool = False) -> str:
     nodes = subscription_nodes(db, user)
-    names = clean_server_names(nodes)
-    return "\n".join(vless_uri(node, device, names[node.id]) for node in nodes)
+    metadata = read_subscription_settings(db)
+    names = clean_server_names(nodes, metadata.server_prefix)
+    body = "\n".join(vless_uri(node, device, names[node.id]) for node in nodes)
+    if include_happ_metadata:
+        connect_url = absolute_connect_url(user)
+        return f"{happ_metadata_comments(metadata, user, connect_url)}\n{body}"
+    return body
 
 
 def clash_yaml(db: Session, user: VpnUser, device: VpnUserDevice) -> str:
     nodes = subscription_nodes(db, user)
-    names = clean_server_names(nodes)
+    metadata = read_subscription_settings(db)
+    names = clean_server_names(nodes, metadata.server_prefix)
     proxies = []
     for node in nodes:
         proxies.append(
@@ -111,13 +123,15 @@ def clash_yaml(db: Session, user: VpnUser, device: VpnUserDevice) -> str:
                 },
             }
         )
-    return render_yaml(
+    body = render_yaml(
         {
             "proxies": proxies,
-            "proxy-groups": [{"name": PROFILE_TITLE, "type": "select", "proxies": [item["name"] for item in proxies]}],
-            "rules": [f"MATCH,{PROFILE_TITLE}"],
+            "proxy-groups": [{"name": metadata.title, "type": "select", "proxies": [item["name"] for item in proxies]}],
+            "rules": [f"MATCH,{metadata.title}"],
         }
     )
+    notice = yaml_notice_comment(metadata, user)
+    return f"{notice}\n{body}" if notice else body
 
 
 def render_yaml(value: Any, indent: int = 0) -> str:
@@ -162,21 +176,40 @@ def yaml_scalar(value: Any) -> str:
     return f'"{escaped}"'
 
 
-def subscription_response(db: Session, user: VpnUser, device: VpnUserDevice, fmt: str | None) -> Response:
+def subscription_response(db: Session, user: VpnUser, device: VpnUserDevice, fmt: str | None, client: str | None = None) -> Response:
     requested = (fmt or "raw").lower()
+    metadata = read_subscription_settings(db)
+    connect_url = absolute_connect_url(user)
+    include_happ_metadata = is_happ_client(client or device.client_name)
     if requested in {"", "raw", "vless"}:
-        return Response(raw_subscription_text(db, user, device), media_type="text/plain; charset=utf-8")
+        return Response(
+            raw_subscription_text(db, user, device, include_happ_metadata=include_happ_metadata),
+            media_type="text/plain; charset=utf-8",
+            headers=subscription_headers(metadata, user, extension="txt", connect_url=connect_url),
+        )
     if requested == "base64":
-        raw = raw_subscription_text(db, user, device).encode("utf-8")
-        return Response(base64.b64encode(raw).decode("ascii"), media_type="text/plain; charset=utf-8")
+        raw = raw_subscription_text(db, user, device, include_happ_metadata=include_happ_metadata).encode("utf-8")
+        return Response(
+            base64.b64encode(raw).decode("ascii"),
+            media_type="text/plain; charset=utf-8",
+            headers=subscription_headers(metadata, user, extension="txt", connect_url=connect_url),
+        )
     if requested == "clash":
         return Response(
             clash_yaml(db, user, device),
             media_type="application/yaml; charset=utf-8",
-            headers={"profile-title": PROFILE_TITLE, "Content-Disposition": 'attachment; filename="akfa-vpn.yaml"'},
+            headers=subscription_headers(metadata, user, extension="yaml", connect_url=connect_url),
         )
     if requested == "singbox":
         body = render_sing_box_config_for_nodes(subscription_nodes(db, user), user, user.access_profile, device)
         json.loads(body)
-        return Response(body, media_type="application/json; charset=utf-8")
+        return Response(
+            body,
+            media_type="application/json; charset=utf-8",
+            headers=subscription_headers(metadata, user, extension="json", connect_url=connect_url),
+        )
     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Неподдерживаемый формат подписки")
+
+
+def is_happ_client(value: str | None) -> bool:
+    return "happ" in (value or "").strip().lower()

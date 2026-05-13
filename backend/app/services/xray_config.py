@@ -301,17 +301,18 @@ COUNTRY_NAMES = {
 }
 
 
-def clean_server_name(node: VpsNode, suffix: int | None = None) -> str:
+def clean_server_name(node: VpsNode, suffix: int | None = None, prefix: str = "AKFA") -> str:
     raw = (node.location or node.name or "").strip()
     flag, name = COUNTRY_NAMES.get(raw.lower(), ("", raw or "VPN"))
-    base = f"AKFA {flag} {name}".replace("  ", " ").strip()
+    clean_prefix = (prefix or "AKFA").strip()
+    base = f"{clean_prefix} {flag} {name}".replace("  ", " ").strip()
     return f"{base} {suffix}" if suffix else base
 
 
-def clean_server_names(nodes: list[VpsNode]) -> dict[int, str]:
+def clean_server_names(nodes: list[VpsNode], prefix: str = "AKFA") -> dict[int, str]:
     buckets: dict[str, list[VpsNode]] = {}
     for node in nodes:
-        buckets.setdefault(clean_server_name(node), []).append(node)
+        buckets.setdefault(clean_server_name(node, prefix=prefix), []).append(node)
     result: dict[int, str] = {}
     for base, items in buckets.items():
         if len(items) == 1:

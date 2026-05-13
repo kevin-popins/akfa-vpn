@@ -324,6 +324,9 @@ def test_device_subscription_requires_matching_hwid_and_clash_is_yaml(client, au
     raw = client.get(f"/sub/{user['subscription_token']}?format=raw", headers={"x-hwid": "device-hwid"})
     assert raw.status_code == 200
     assert "encryption=none" in raw.text
+    assert raw.headers["profile-title"] == "AKFA VPN"
+    assert raw.headers["profile-update-interval"] == "12"
+    assert raw.headers["subscription-userinfo"].startswith("upload=0; download=0; total=0")
     device = db_session.query(VpnUserDevice).filter_by(vpn_user_id=user["id"]).one()
 
     assert client.get(f"/sub/device/{device.subscription_token}").status_code == 403
@@ -333,18 +336,78 @@ def test_device_subscription_requires_matching_hwid_and_clash_is_yaml(client, au
 
     clash = client.get(f"/sub/{user['subscription_token']}?format=clash", headers={"x-hwid": "device-hwid"})
     assert clash.status_code == 200
-    assert clash.headers["profile-title"] == "akfa vpn"
+    assert clash.headers["profile-title"] == "AKFA VPN"
     assert 'filename="akfa-vpn.yaml"' in clash.headers["content-disposition"]
+    assert "filename*=UTF-8''akfa-vpn.yaml" in clash.headers["content-disposition"]
+    assert clash.text.startswith("# upload=0; download=0; total=0;")
     assert "proxies:" in clash.text
     assert "proxy-groups:" in clash.text
     assert "rules:" in clash.text
+    assert '- name: "AKFA VPN"' in clash.text
     assert "AKFA 🇳🇱 Нидерланды" in clash.text
     assert "device-sub" not in clash.text
     assert user["subscription_token"] not in clash.text
 
     encoded = client.get(f"/sub/{user['subscription_token']}?format=base64", headers={"x-hwid": "device-hwid"})
     assert encoded.status_code == 200
+    assert encoded.headers["profile-title"] == "AKFA VPN"
     assert base64.b64decode(encoded.text).decode("utf-8").startswith("vless://")
+
+
+def test_subscription_settings_customize_client_metadata(client, auth_headers, db_session):
+    saved = client.put(
+        "/admin/settings/subscription",
+        headers=auth_headers,
+        json={
+            "title": "Mushroom VPN",
+            "filename": "mushroom-vpn",
+            "announcement": "Нажмите обновление, если VPN не работает.\nВыбирайте ближайший сервер.",
+            "update_interval_hours": 6,
+            "server_prefix": "MUSH",
+        },
+    )
+    assert saved.status_code == 200
+    assert saved.json()["title"] == "Mushroom VPN"
+
+    node_payload = client.post(
+        "/admin/nodes",
+        headers=auth_headers,
+        json={"name": "Amsterdam", "location": "Netherlands", "ip_address": "203.0.113.92", "ssh_username": "root", "ssh_password": "secret"},
+    ).json()
+    node = db_session.get(VpsNode, node_payload["id"])
+    node.status = "online"
+    node.reality_public_key = "public"
+    node.reality_private_key = "private"
+    node.short_id = "abcdef1234567890"
+    db_session.commit()
+    user = client.post(
+        "/admin/users",
+        headers=auth_headers,
+        json={"first_name": "Meta", "last_name": "User", "username": "meta-user"},
+    ).json()
+
+    raw = client.get(f"/sub/{user['subscription_token']}?format=raw&client=happ", headers={"x-hwid": "meta-phone"})
+    assert raw.status_code == 200
+    assert raw.headers["profile-title"] == "Mushroom VPN"
+    assert raw.headers["profile-update-interval"] == "6"
+    assert raw.headers["announce"].startswith("base64:")
+    assert 'filename="mushroom-vpn.txt"' in raw.headers["content-disposition"]
+    assert raw.text.startswith("#profile-title: base64:")
+    assert "#subscription-userinfo: upload=0; download=0; total=0" in raw.text
+    assert "#announce: base64:" in raw.text
+    announce_line = next(line for line in raw.text.splitlines() if line.startswith("#announce: base64:"))
+    decoded_announce = base64.b64decode(announce_line.removeprefix("#announce: base64:")).decode("utf-8")
+    assert "Нажмите обновление" in decoded_announce
+    assert "MUSH%20%F0%9F%87%B3%F0%9F%87%B1%20%D0%9D%D0%B8%D0%B4%D0%B5%D1%80%D0%BB%D0%B0%D0%BD%D0%B4%D1%8B" in raw.text
+
+    clash = client.get(f"/sub/{user['subscription_token']}?format=clash", headers={"x-hwid": "meta-phone"})
+    assert clash.status_code == 200
+    assert clash.headers["profile-title"] == "Mushroom VPN"
+    assert 'filename="mushroom-vpn.yaml"' in clash.headers["content-disposition"]
+    assert "# Нажмите обновление, если VPN не работает." in clash.text
+    assert "# Выбирайте ближайший сервер." in clash.text
+    assert '- name: "Mushroom VPN"' in clash.text
+    assert "MUSH 🇳🇱 Нидерланды" in clash.text
 
 
 def test_subscription_returns_all_client_formats(client, auth_headers, db_session):
@@ -377,7 +440,8 @@ def test_subscription_returns_all_client_formats(client, auth_headers, db_sessio
     plain = client.get(f"/sub/{user['subscription_token']}", headers={"x-hwid": "phone-1"})
     assert plain.status_code == 200
     assert plain.headers["content-type"].startswith("text/plain")
-    assert plain.text.startswith("vless://")
+    assert plain.text.startswith("#profile-title: base64:")
+    assert "vless://" in plain.text
 
 
 def test_subscription_for_user_with_two_nodes_returns_two_vless_uris_primary_first(client, auth_headers, db_session):

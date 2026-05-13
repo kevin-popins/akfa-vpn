@@ -201,6 +201,11 @@ ADMIN_EMAIL=ADMIN_EMAIL
 CORS_ORIGINS=["https://PANEL_DOMAIN","https://PUBLIC_CONNECT_DOMAIN"]
 SECURE_COOKIES=true
 SUBSCRIPTION_BASE_URL=https://PUBLIC_CONNECT_DOMAIN
+SUBSCRIPTION_TITLE=AKFA VPN
+SUBSCRIPTION_FILENAME=akfa-vpn
+SUBSCRIPTION_ANNOUNCEMENT=
+SUBSCRIPTION_UPDATE_INTERVAL_HOURS=12
+SUBSCRIPTION_SERVER_PREFIX=AKFA
 ```
 
 Назначение:
@@ -218,6 +223,11 @@ SUBSCRIPTION_BASE_URL=https://PUBLIC_CONNECT_DOMAIN
 | `CORS_ORIGINS` | Разрешенные origins frontend. |
 | `SECURE_COOKIES` | `true` для HTTPS production, `false` для local HTTP. |
 | `SUBSCRIPTION_BASE_URL` | Публичная база для connect/subscription URLs. |
+| `SUBSCRIPTION_TITLE` | Default-название подписки для VPN-клиентов, если в админке не сохранена настройка. |
+| `SUBSCRIPTION_FILENAME` | Default-имя файла подписки без расширения. |
+| `SUBSCRIPTION_ANNOUNCEMENT` | Default-текст подсказки для подписки. Для runtime удобнее менять в админке. |
+| `SUBSCRIPTION_UPDATE_INTERVAL_HOURS` | Default-интервал автообновления подписки в часах. |
+| `SUBSCRIPTION_SERVER_PREFIX` | Default-prefix серверов в подписке, например `AKFA` в `AKFA 🇳🇱 Нидерланды`. |
 
 Сгенерировать Fernet key:
 
@@ -789,6 +799,16 @@ POST /public/connect/{user_token}/install-link
 
 ## Subscription formats
 
+Все форматы подписки получают metadata headers:
+
+- `profile-title` / `profile-title*` - название подписки;
+- `Content-Disposition` - стабильное имя файла (`filename` и `filename*`);
+- `profile-update-interval` - рекомендуемый интервал обновления в часах;
+- `subscription-userinfo` - `upload`, `download`, `total`, `expire` для клиентов, которые показывают трафик и срок действия;
+- `profile-web-page-url` - ссылка на public connect page пользователя.
+
+Настройки названия, файла, текста подсказки, интервала и prefix серверов меняются в админке: Settings -> Подписка в VPN-клиентах. Defaults можно задать через env-переменные `SUBSCRIPTION_*`.
+
 ### Raw
 
 ```text
@@ -814,6 +834,18 @@ VLESS URI содержит:
 - `device.uuid`;
 - clean server remark.
 
+Для `client=happ` перед VLESS lines добавляется Happ metadata block:
+
+```text
+#profile-title: base64:...
+#profile-update-interval: 12
+#subscription-userinfo: upload=0; download=0; total=107374182400; expire=1767225600
+#profile-web-page-url: https://PUBLIC_CONNECT_DOMAIN/connect/{user_token}
+#announce: base64:...
+```
+
+Для остальных raw-клиентов body остается списком чистых `vless://` lines без metadata comments.
+
 ### Base64
 
 ```text
@@ -832,13 +864,19 @@ Headers:
 
 ```text
 Content-Type: application/yaml; charset=utf-8
-profile-title: akfa vpn
-Content-Disposition: attachment; filename="akfa-vpn.yaml"
+profile-title: AKFA VPN
+Content-Disposition: attachment; filename="akfa-vpn.yaml"; filename*=UTF-8''akfa-vpn.yaml
+profile-update-interval: 12
+subscription-userinfo: upload=0; download=0; total=107374182400; expire=1767225600
 ```
+
+В Clash YAML первым comment-блоком добавляется `subscription-userinfo` и optional admin announcement. YAML comments безопасны для парсеров Clash/Mihomo, а клиенты, которые умеют показывать эти строки, смогут отобразить подсказку.
 
 YAML:
 
 ```yaml
+# upload=0; download=0; total=107374182400; expire=1767225600;
+# Нажмите обновление, если VPN не работает.
 proxies:
   - name: "AKFA 🇳🇱 Нидерланды"
     type: vless
@@ -855,12 +893,12 @@ proxies:
       public-key: "<node.reality_public_key>"
       short-id: "<node.short_id>"
 proxy-groups:
-  - name: "akfa vpn"
+  - name: "AKFA VPN"
     type: select
     proxies:
       - "AKFA 🇳🇱 Нидерланды"
 rules:
-  - MATCH,akfa vpn
+  - MATCH,AKFA VPN
 ```
 
 ### sing-box
@@ -876,7 +914,7 @@ GET /sub/{user_token}?format=singbox
 Profile/subscription name:
 
 ```text
-akfa vpn
+AKFA VPN
 ```
 
 Server names:
@@ -1300,10 +1338,10 @@ curl -i \
 Проверить:
 
 - `Content-Type: application/yaml; charset=utf-8`;
-- `profile-title: akfa vpn`;
+- `profile-title: AKFA VPN`;
 - `Content-Disposition: attachment; filename="akfa-vpn.yaml"`;
 - YAML содержит `proxies`, `proxy-groups`, `rules`;
-- proxy-group называется `akfa vpn`;
+- proxy-group называется `AKFA VPN` или кастомным названием из настроек подписки;
 - proxy names чистые, без username/token/UUID.
 
 ### Проверка node traffic Dashboard

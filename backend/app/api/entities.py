@@ -58,6 +58,7 @@ from app.schemas.entities import (
     TrafficUserRead,
     PublicHelpLinks,
     PublicConnectRead,
+    SubscriptionSettings,
     VpnUserDeviceRead,
     VpnUserDeviceUpdate,
     XrayImportRequest,
@@ -89,6 +90,11 @@ from app.services.server_metrics import collect_nodes_metrics
 from app.services.ssh_installer import XrayInstaller
 from app.services.hwid import apply_device_metadata, build_display_name, compute_hwid_context
 from app.services.subscriptions import subscription_payload, subscription_response, validate_subscription_user
+from app.services.subscription_settings import (
+    SubscriptionSettingsData,
+    read_subscription_settings,
+    write_subscription_settings,
+)
 from app.services.traffic import (
     collect_traffic as collect_traffic_stats,
     enforce_expiration_and_limits,
@@ -458,6 +464,17 @@ def save_public_help_links(db: Session, payload: PublicHelpLinks) -> PublicHelpL
     return read_public_help_links(db)
 
 
+def subscription_settings_read(db: Session) -> SubscriptionSettings:
+    metadata = read_subscription_settings(db)
+    return SubscriptionSettings(
+        title=metadata.title,
+        filename=metadata.filename,
+        announcement=metadata.announcement,
+        update_interval_hours=metadata.update_interval_hours,
+        server_prefix=metadata.server_prefix,
+    )
+
+
 @router.get("/dashboard", response_model=DashboardStats)
 def dashboard(_: Admin = Depends(current_admin), db: Session = Depends(get_db)) -> DashboardStats:
     visible_users = VpnUser.status != UserStatus.deleted.value
@@ -485,6 +502,38 @@ def update_public_help_links(
     audit(db, "update", "public_help_links", admin_id=admin.id)
     db.commit()
     return links
+
+
+@router.get("/settings/subscription", response_model=SubscriptionSettings)
+def get_subscription_settings(_: Admin = Depends(current_admin), db: Session = Depends(get_db)) -> SubscriptionSettings:
+    return subscription_settings_read(db)
+
+
+@router.put("/settings/subscription", response_model=SubscriptionSettings)
+def update_subscription_settings(
+    payload: SubscriptionSettings,
+    admin: Admin = Depends(require_write),
+    db: Session = Depends(get_db),
+) -> SubscriptionSettings:
+    metadata = write_subscription_settings(
+        db,
+        SubscriptionSettingsData(
+            title=payload.title,
+            filename=payload.filename,
+            announcement=payload.announcement,
+            update_interval_hours=payload.update_interval_hours,
+            server_prefix=payload.server_prefix,
+        ),
+    )
+    audit(db, "update", "subscription_settings", admin_id=admin.id)
+    db.commit()
+    return SubscriptionSettings(
+        title=metadata.title,
+        filename=metadata.filename,
+        announcement=metadata.announcement,
+        update_interval_hours=metadata.update_interval_hours,
+        server_prefix=metadata.server_prefix,
+    )
 
 
 @router.get("/access-profiles", response_model=list[AccessProfileRead])
@@ -1609,7 +1658,7 @@ def device_subscription(
         return _plain_forbidden("Ссылка подписки привязана к другому устройству")
     _touch_device_from_context(device, context, db)
     db.commit()
-    response = subscription_response(db, user, device, format)
+    response = subscription_response(db, user, device, format, client=device.client_name)
     response.headers["x-hwid-limit"] = "true"
     response.headers["x-hwid-active"] = "true"
     return response
@@ -1639,7 +1688,7 @@ async def subscription(
         if device.status == DeviceStatus.active.value:
             _touch_device_from_context(device, context, db)
             db.commit()
-            response = subscription_response(db, user, device, format)
+            response = subscription_response(db, user, device, format, client=client or device.client_name)
             response.headers["x-hwid-limit"] = "true"
             response.headers["x-hwid-active"] = "true"
             return response
@@ -1677,7 +1726,7 @@ async def subscription(
         )
         if not existing:
             return _plain_error("Не удалось зарегистрировать устройство", status.HTTP_503_SERVICE_UNAVAILABLE)
-        response = subscription_response(db, user, existing, format)
+        response = subscription_response(db, user, existing, format, client=client or existing.client_name)
         response.headers["x-hwid-limit"] = "true"
         response.headers["x-hwid-active"] = "true"
         return response
@@ -1709,7 +1758,7 @@ async def subscription(
         return _plain_error("Не удалось применить конфигурацию на сервер", status.HTTP_503_SERVICE_UNAVAILABLE)
     db.commit()
     logger.info("subscription new hwid apply success user_id=%s device_id=%s", user.id, device.id)
-    response = subscription_response(db, user, device, format)
+    response = subscription_response(db, user, device, format, client=client or device.client_name)
     response.headers["x-hwid-limit"] = "true"
     response.headers["x-hwid-active"] = "true"
     return response

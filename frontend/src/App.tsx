@@ -27,7 +27,7 @@ import { Button } from "./components/ui/button";
 import { Card, CardContent, CardHeader } from "./components/ui/card";
 import { Field, Input, Select, Textarea } from "./components/ui/input";
 import { StatusBadge, Table } from "./components/ui/table";
-import { api, isApiMaintenanceError, type AccessProfile, type ConfigApplySummary, type DashboardStats, type Department, type NodeMetric, type NodeRead, type PublicConnect, type PublicHelpLinks, type SniCheckResult, type SshCheckResult, type SubscriptionVlessUri, type TrafficUser, type VpnUser, type VpnUserDevice, type XrayProbeResult } from "./lib/api";
+import { api, isApiMaintenanceError, type AccessProfile, type ConfigApplySummary, type DashboardStats, type Department, type NodeMetric, type NodeRead, type PublicConnect, type PublicHelpLinks, type SniCheckResult, type SshCheckResult, type SubscriptionSettings, type SubscriptionVlessUri, type TrafficUser, type VpnUser, type VpnUserDevice, type XrayProbeResult } from "./lib/api";
 import { buildConnectMessage, formatBytes } from "./lib/utils";
 
 type SessionState = "checking" | "login" | "totp" | "setup" | "ready";
@@ -103,6 +103,14 @@ const defaultPublicHelpLinks: PublicHelpLinks = {
   iphone_happ_url: "",
   windows_fclashx_url: "",
   macos_fclashx_url: ""
+};
+
+const defaultSubscriptionSettings: SubscriptionSettings = {
+  title: "AKFA VPN",
+  filename: "akfa-vpn",
+  announcement: "",
+  update_interval_hours: 12,
+  server_prefix: "AKFA"
 };
 
 function App() {
@@ -3379,20 +3387,29 @@ function SettingsPage() {
   const [admin, setAdmin] = useState<{ email: string; role: string; totp_enabled: boolean } | null>(null);
   const [setup, setSetup] = useState<{ secret: string; otpauth_url: string } | null>(null);
   const [helpLinks, setHelpLinks] = useState<PublicHelpLinks>(defaultPublicHelpLinks);
+  const [subscriptionSettings, setSubscriptionSettings] = useState<SubscriptionSettings>(defaultSubscriptionSettings);
   const [savingHelpLinks, setSavingHelpLinks] = useState(false);
+  const [savingSubscriptionSettings, setSavingSubscriptionSettings] = useState(false);
   const [code, setCode] = useState("");
   const [password, setPassword] = useState("");
   const [message, setMessage] = useState("");
 
   useEffect(() => {
-    Promise.all([api.me(), api.publicHelpLinks()])
-      .then(([adminResponse, linksResponse]) => {
+    Promise.all([api.me(), api.publicHelpLinks(), api.subscriptionSettings()])
+      .then(([adminResponse, linksResponse, subscriptionResponse]) => {
         setAdmin(adminResponse);
         setHelpLinks({
           android_happ_url: linksResponse.android_happ_url || "",
           iphone_happ_url: linksResponse.iphone_happ_url || "",
           windows_fclashx_url: linksResponse.windows_fclashx_url || "",
           macos_fclashx_url: linksResponse.macos_fclashx_url || ""
+        });
+        setSubscriptionSettings({
+          title: subscriptionResponse.title || defaultSubscriptionSettings.title,
+          filename: subscriptionResponse.filename || defaultSubscriptionSettings.filename,
+          announcement: subscriptionResponse.announcement || "",
+          update_interval_hours: subscriptionResponse.update_interval_hours || defaultSubscriptionSettings.update_interval_hours,
+          server_prefix: subscriptionResponse.server_prefix || defaultSubscriptionSettings.server_prefix
         });
       })
       .catch((error) => setMessage(error instanceof Error ? error.message : "Настройки недоступны"));
@@ -3438,6 +3455,10 @@ function SettingsPage() {
     setHelpLinks((current) => ({ ...current, [key]: value }));
   }
 
+  function updateSubscriptionSetting<K extends keyof SubscriptionSettings>(key: K, value: SubscriptionSettings[K]) {
+    setSubscriptionSettings((current) => ({ ...current, [key]: value }));
+  }
+
   async function saveHelpLinks() {
     setSavingHelpLinks(true);
     try {
@@ -3453,6 +3474,25 @@ function SettingsPage() {
       setMessage(error instanceof Error ? error.message : "Ссылки не сохранены");
     } finally {
       setSavingHelpLinks(false);
+    }
+  }
+
+  async function saveSubscriptionSettings() {
+    setSavingSubscriptionSettings(true);
+    try {
+      const saved = await api.saveSubscriptionSettings(subscriptionSettings);
+      setSubscriptionSettings({
+        title: saved.title,
+        filename: saved.filename,
+        announcement: saved.announcement || "",
+        update_interval_hours: saved.update_interval_hours,
+        server_prefix: saved.server_prefix
+      });
+      setMessage("Настройки подписки сохранены");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Настройки подписки не сохранены");
+    } finally {
+      setSavingSubscriptionSettings(false);
     }
   }
 
@@ -3497,6 +3537,59 @@ function SettingsPage() {
             )}
           </div>
           {setup ? <div className="grid place-items-center rounded-md border border-akfa-line p-4"><QRCodeCanvas value={setup.otpauth_url} size={180} /></div> : null}
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader>
+          <h2 className="font-semibold">Подписка в VPN-клиентах</h2>
+          <p className="mt-1 text-sm text-akfa-muted">Название, имя файла, автообновление, строка описания и prefix серверов для Happ, FClashX и совместимых клиентов.</p>
+        </CardHeader>
+        <CardContent className="grid gap-3 md:grid-cols-2">
+          <Field label="Название подписки">
+            <Input
+              value={subscriptionSettings.title}
+              onChange={(event) => updateSubscriptionSetting("title", event.target.value)}
+              placeholder="AKFA VPN"
+            />
+          </Field>
+          <Field label="Имя файла">
+            <Input
+              value={subscriptionSettings.filename}
+              onChange={(event) => updateSubscriptionSetting("filename", event.target.value)}
+              placeholder="akfa-vpn"
+            />
+          </Field>
+          <Field label="Prefix серверов">
+            <Input
+              value={subscriptionSettings.server_prefix}
+              onChange={(event) => updateSubscriptionSetting("server_prefix", event.target.value)}
+              placeholder="AKFA"
+            />
+          </Field>
+          <Field label="Автообновление, часов">
+            <Input
+              value={String(subscriptionSettings.update_interval_hours)}
+              onChange={(event) => updateSubscriptionSetting("update_interval_hours", Number(event.target.value) || 1)}
+              min={1}
+              max={168}
+              type="number"
+            />
+          </Field>
+          <Field label="Текст для подписки">
+            <Textarea
+              className="min-h-[120px]"
+              value={subscriptionSettings.announcement}
+              onChange={(event) => updateSubscriptionSetting("announcement", event.target.value)}
+              placeholder={"Нажмите обновление, если VPN не работает.\nБыстрый сервер выбирайте по ближайшей стране."}
+            />
+          </Field>
+          <div className="grid content-end gap-2">
+            <Message tone="warning" text="Happ получает metadata строками #profile-title и #announce в raw-подписке. Для остальных raw-клиентов тело остается списком VLESS-ссылок." />
+            <Button onClick={saveSubscriptionSettings} disabled={savingSubscriptionSettings}>
+              <Save size={16} />
+              {savingSubscriptionSettings ? "Сохраняем..." : "Сохранить настройки подписки"}
+            </Button>
+          </div>
         </CardContent>
       </Card>
       <Card>
@@ -4168,7 +4261,7 @@ function connectOptions(token: string) {
       client: "FClashX",
       helpKey: "windows_fclashx_url" as const,
       path: `/sub/${token}?platform=windows&client=fclashx&format=clash`,
-      steps: ["Установите FClashX.", "Импортируйте ссылку подписки.", "Выберите профиль akfa vpn и подключитесь."]
+      steps: ["Установите FClashX.", "Импортируйте ссылку подписки.", "Выберите профиль подписки и подключитесь."]
     },
     {
       id: "macos-fclashx",
@@ -4176,7 +4269,7 @@ function connectOptions(token: string) {
       client: "FClashX / Clash",
       helpKey: "macos_fclashx_url" as const,
       path: `/sub/${token}?platform=macos&client=fclashx&format=clash`,
-      steps: ["Установите FClashX или Clash.", "Импортируйте ссылку YAML-подписки.", "Выберите профиль akfa vpn."]
+      steps: ["Установите FClashX или Clash.", "Импортируйте ссылку YAML-подписки.", "Выберите профиль подписки."]
     }
   ];
 }
