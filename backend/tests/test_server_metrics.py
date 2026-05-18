@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 from app.models import AuditLog, TrafficSnapshot, VpsNode
@@ -5,6 +6,7 @@ from app.services.server_metrics import (
     aggregate_node_traffic,
     apply_node_raw_counters,
     base_metric_row,
+    collect_nodes_metrics,
     parse_cpu_percent,
     parse_df_output,
     parse_free_output,
@@ -110,3 +112,33 @@ def test_background_collect_does_not_create_audit_entry(client, auth_headers, db
     audit_actions = [row.action for row in db_session.query(AuditLog).all()]
     assert "collect_stats" not in audit_actions
     assert "debug_collect_stats" not in audit_actions
+
+
+async def test_collect_nodes_metrics_returns_partial_rows_when_one_node_times_out(db_session, monkeypatch):
+    ok = VpsNode(name="Online", ip_address="203.0.113.100", ssh_username="root", status="online")
+    bad = VpsNode(name="Dead host", ip_address="203.0.113.101", ssh_username="root", status="online")
+    db_session.add_all([ok, bad])
+    db_session.commit()
+
+    async def fake_run_node_metric_commands(node):
+        if node.id == bad.id:
+            raise asyncio.TimeoutError()
+        return {
+            "cpu": "cpu  100 0 100 800 0 0 0 0 0 0\nAKFA_CPU_SAMPLE\ncpu  150 0 150 900 0 0 0 0 0 0\n",
+            "ram": "              total        used        free\nMem:     1000000000   500000000   500000000\n",
+            "disk": "Filesystem 1B-blocks Used Available Use% Mounted on\n/dev/vda1 2000000000 500000000 1500000000 25% /\n",
+            "network": "eth0\nAKFA_NET_DEV\neth0: 2048 2 0 0 0 0 0 0 4096 3 0 0 0 0 0 0\n",
+            "xray": '{"stat":[]}',
+        }
+
+    monkeypatch.setattr("app.services.server_metrics.run_node_metric_commands", fake_run_node_metric_commands)
+
+    rows = await collect_nodes_metrics(db_session, [ok, bad], "all")
+    by_id = {row["node_id"]: row for row in rows}
+
+    assert by_id[ok.id]["metrics_status"] == "ok"
+    assert by_id[ok.id]["cpu_percent"] == 50.0
+    assert by_id[bad.id]["status"] == "timeout"
+    assert by_id[bad.id]["metrics_status"] == "timeout"
+    assert by_id[bad.id]["system_traffic_available"] is False
+    assert "не ответил" in by_id[bad.id]["metrics_error"]

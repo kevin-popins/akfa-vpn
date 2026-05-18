@@ -520,6 +520,25 @@ sudo nginx -t
 systemctl status nginx --no-pager
 ```
 
+### J. Один VPS недоступен, но панель должна открываться
+
+Если хостер выключил или изолировал один из подключённых серверов, backend не должен зависать на сборе метрик этой node.
+
+Проверка:
+
+```bash
+curl -fsS http://127.0.0.1:8000/health
+curl -fsS -H "Cookie: ..." "https://PANEL_DOMAIN/admin/nodes/metrics?period=all"
+docker compose logs --tail=200 backend | grep "node metrics failed"
+```
+
+Ожидаемое поведение:
+
+- `/admin/nodes`, `/admin/dashboard`, `/admin/users`, `/admin/traffic/overview` продолжают отвечать;
+- `/admin/nodes/metrics?period=all` возвращает JSON с частичными данными;
+- проблемная node получает `metrics_status=timeout`, `ssh_error` или `unreachable`;
+- frontend показывает сохранённые данные и предупреждение по node, а не экран «Панель временно перезапускается».
+
 ## 14. Watchdog
 
 Watchdog проверяет backend health endpoint:

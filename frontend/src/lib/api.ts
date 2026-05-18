@@ -89,6 +89,8 @@ export type NodeMetric = {
   name: string;
   ip_address: string;
   status: string;
+  metrics_status: "pending" | "ok" | "skipped" | "timeout" | "ssh_error" | "unreachable" | string;
+  metrics_error?: string | null;
   cpu_percent?: number | null;
   ram_used_bytes?: number | null;
   ram_total_bytes?: number | null;
@@ -318,6 +320,7 @@ export type TrafficCollectResult = {
 };
 
 const API_TIMEOUT_MS = 12000;
+type ApiRequestInit = RequestInit & { maintenanceOnFailure?: boolean };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
@@ -358,9 +361,9 @@ function notifyMaintenance() {
 
 let csrfToken = localStorage.getItem("akfa_csrf") || "";
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+async function request<T>(path: string, options: ApiRequestInit = {}): Promise<T> {
   const isFormData = options.body instanceof FormData;
-  const { headers: optionHeaders, signal: optionSignal, ...fetchOptions } = options;
+  const { headers: optionHeaders, signal: optionSignal, maintenanceOnFailure = false, ...fetchOptions } = options;
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
   if (optionSignal) {
@@ -379,14 +382,21 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
       }
     });
   } catch (error) {
-    notifyMaintenance();
-    throw new ApiMaintenanceError("Панель временно перезапускается");
+    if (maintenanceOnFailure) {
+      notifyMaintenance();
+      throw new ApiMaintenanceError("Панель временно перезапускается");
+    }
+    const aborted = error instanceof DOMException && error.name === "AbortError";
+    throw new Error(aborted ? "Запрос к API превысил timeout. Данные на экране не очищены." : "API временно недоступен. Данные на экране не очищены.");
   } finally {
     window.clearTimeout(timeout);
   }
   if ([502, 503, 504].includes(response.status)) {
-    notifyMaintenance();
-    throw new ApiMaintenanceError("Панель временно перезапускается");
+    if (maintenanceOnFailure) {
+      notifyMaintenance();
+      throw new ApiMaintenanceError("Панель временно перезапускается");
+    }
+    throw new Error("API временно недоступен. Данные на экране не очищены.");
   }
   if (!response.ok) {
     const text = await response.text();
@@ -470,7 +480,7 @@ export const api = {
     return request<{ csrf_token?: string }>("/auth/2fa/verify", { method: "POST", body: JSON.stringify({ login_token: loginToken, code }) });
   },
   me() {
-    return request<{ email: string; role: string; totp_enabled: boolean }>("/auth/me");
+    return request<{ email: string; role: string; totp_enabled: boolean }>("/auth/me", { maintenanceOnFailure: true });
   },
   startTotpSetup(loginToken?: string) {
     return request<{ secret: string; otpauth_url: string }>("/auth/2fa/setup/start", { method: "POST", body: JSON.stringify({ login_token: loginToken || null }) });

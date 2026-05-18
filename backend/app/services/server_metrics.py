@@ -1,5 +1,8 @@
 import json
+import asyncio
+import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -7,9 +10,12 @@ import asyncssh
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.core.security import mask_secret
 from app.models import NodeStatus, TrafficSnapshot, VpsNode
 from app.services.ssh_host_keys import ssh_connection_options
 from app.services.traffic import XRAY_STATS_COMMAND
+
+logger = logging.getLogger(__name__)
 
 INBOUND_TRAFFIC_RE = re.compile(r"inbound>>>([^>]+)>>>traffic>>>(uplink|downlink)")
 CPU_SAMPLE_COMMAND = "cat /proc/stat; echo AKFA_CPU_SAMPLE; sleep 0.2; cat /proc/stat"
@@ -18,12 +24,41 @@ DISK_COMMAND = "df -B1 /"
 NETWORK_COMMAND = "ip route show default 2>/dev/null | awk 'NR==1 {for (i=1;i<=NF;i++) if ($i==\"dev\") {print $(i+1); exit}}'; echo AKFA_NET_DEV; cat /proc/net/dev"
 IGNORED_INBOUND_TAGS = {"api-in", "api"}
 IGNORED_NETWORK_INTERFACES = ("lo", "docker", "br-", "veth", "virbr", "zt", "tailscale")
+NODE_METRICS_CONNECT_TIMEOUT_SECONDS = 4
+NODE_METRICS_COMMAND_TIMEOUT_SECONDS = 4
+NODE_METRICS_NODE_TIMEOUT_SECONDS = 12
+NODE_METRICS_MAX_CONCURRENCY = 5
+
+
+class NodeMetricCommandTimeout(TimeoutError):
+    def __init__(self, command_key: str) -> None:
+        super().__init__(f"Команда метрик '{command_key}' превысила timeout {NODE_METRICS_COMMAND_TIMEOUT_SECONDS}s")
+        self.command_key = command_key
 
 
 async def collect_nodes_metrics(db: Session, nodes: list[VpsNode], period: str = "all") -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for node in nodes:
-        rows.append(await collect_node_metrics(db, node, period))
+    rows = [base_metric_row(db, node, period) for node in nodes]
+    row_by_node_id = {row["node_id"]: row for row in rows}
+    online_nodes = [node for node in nodes if node.status == NodeStatus.online.value]
+    semaphore = asyncio.Semaphore(NODE_METRICS_MAX_CONCURRENCY)
+
+    async def bounded_collect(node: VpsNode) -> tuple[VpsNode, dict[str, str] | Exception]:
+        async with semaphore:
+            started = time.monotonic()
+            try:
+                result = await asyncio.wait_for(run_node_metric_commands(node), timeout=NODE_METRICS_NODE_TIMEOUT_SECONDS)
+                return node, result
+            except Exception as exc:
+                log_node_metrics_failure(node, exc, time.monotonic() - started)
+                return node, exc
+
+    results = await asyncio.gather(*(bounded_collect(node) for node in online_nodes), return_exceptions=False)
+    for node, result in results:
+        row = row_by_node_id[node.id]
+        if isinstance(result, Exception):
+            apply_node_metric_error(row, result)
+            continue
+        apply_node_metric_outputs(db, node, row, result, period)
     db.commit()
     return rows
 
@@ -33,44 +68,99 @@ async def collect_node_metrics(db: Session, node: VpsNode, period: str = "all") 
     if node.status != NodeStatus.online.value:
         row["errors"].append("Нода не online")
         return row
+    started = time.monotonic()
     try:
-        command_outputs = await run_node_metric_commands(node)
-        cpu_percent = parse_cpu_percent(command_outputs.get("cpu", ""))
-        ram = parse_free_output(command_outputs.get("ram", ""))
-        disk = parse_df_output(command_outputs.get("disk", ""))
-        network = parse_system_network_stats(command_outputs.get("network", ""))
-        if command_outputs.get("network_error"):
-            network = unavailable_system_network_stats(command_outputs["network_error"])
-        inbound_raw = parse_inbound_stats(command_outputs.get("xray", ""))
-        collected_at = datetime.now(timezone.utc)
-        if inbound_raw["upload"] > 0 or inbound_raw["download"] > 0:
-            apply_node_raw_counters(db, node, inbound_raw["upload"], inbound_raw["download"], collected_at)
-            traffic_source = "xray_inbound"
-        else:
-            node.last_metrics_collected_at = collected_at
-            traffic_source = "node_traffic"
-        traffic = aggregate_node_traffic(db, node.id, period)
-        row.update(
-            {
-                "cpu_percent": cpu_percent,
-                **ram,
-                **disk,
-                "vpn_traffic_upload_bytes": traffic["upload"],
-                "vpn_traffic_download_bytes": traffic["download"],
-                "vpn_traffic_total_bytes": traffic["total"],
-                "vpn_traffic_source": "xray_stats",
-                "traffic_upload_bytes": traffic["upload"],
-                "traffic_download_bytes": traffic["download"],
-                "traffic_total_bytes": traffic["total"],
-                "traffic_type": "vpn_xray",
-                "traffic_source": traffic_source,
-                **network,
-                "last_checked_at": node.last_metrics_collected_at,
-            }
-        )
+        command_outputs = await asyncio.wait_for(run_node_metric_commands(node), timeout=NODE_METRICS_NODE_TIMEOUT_SECONDS)
+        apply_node_metric_outputs(db, node, row, command_outputs, period)
     except Exception as exc:
-        row["errors"].append(str(exc))
+        log_node_metrics_failure(node, exc, time.monotonic() - started)
+        apply_node_metric_error(row, exc)
     return row
+
+
+def apply_node_metric_outputs(db: Session, node: VpsNode, row: dict[str, Any], command_outputs: dict[str, str], period: str) -> None:
+    cpu_percent = parse_cpu_percent(command_outputs.get("cpu", ""))
+    ram = parse_free_output(command_outputs.get("ram", ""))
+    disk = parse_df_output(command_outputs.get("disk", ""))
+    network = parse_system_network_stats(command_outputs.get("network", ""))
+    if command_outputs.get("network_error"):
+        network = unavailable_system_network_stats(command_outputs["network_error"])
+    inbound_raw = parse_inbound_stats(command_outputs.get("xray", ""))
+    collected_at = datetime.now(timezone.utc)
+    if inbound_raw["upload"] > 0 or inbound_raw["download"] > 0:
+        apply_node_raw_counters(db, node, inbound_raw["upload"], inbound_raw["download"], collected_at)
+        traffic_source = "xray_inbound"
+    else:
+        node.last_metrics_collected_at = collected_at
+        traffic_source = "node_traffic"
+    traffic = aggregate_node_traffic(db, node.id, period)
+    row.update(
+        {
+            "metrics_status": "ok",
+            "metrics_error": None,
+            "cpu_percent": cpu_percent,
+            **ram,
+            **disk,
+            "vpn_traffic_upload_bytes": traffic["upload"],
+            "vpn_traffic_download_bytes": traffic["download"],
+            "vpn_traffic_total_bytes": traffic["total"],
+            "vpn_traffic_source": "xray_stats",
+            "traffic_upload_bytes": traffic["upload"],
+            "traffic_download_bytes": traffic["download"],
+            "traffic_total_bytes": traffic["total"],
+            "traffic_type": "vpn_xray",
+            "traffic_source": traffic_source,
+            **network,
+            "last_checked_at": node.last_metrics_collected_at,
+        }
+    )
+
+
+def apply_node_metric_error(row: dict[str, Any], exc: Exception) -> None:
+    status = classify_node_metric_error(exc)
+    message = human_node_metric_error(status, exc)
+    row.update(
+        {
+            "status": status,
+            "metrics_status": status,
+            "metrics_error": message,
+            **unavailable_system_network_stats(message),
+        }
+    )
+    row["errors"].append(message)
+
+
+def classify_node_metric_error(exc: Exception) -> str:
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, NodeMetricCommandTimeout)):
+        return "timeout"
+    if isinstance(exc, (asyncssh.PermissionDenied, asyncssh.DisconnectError)):
+        return "ssh_error"
+    if isinstance(exc, OSError):
+        return "unreachable"
+    if isinstance(exc, asyncssh.Error):
+        return "ssh_error"
+    return "unreachable"
+
+
+def human_node_metric_error(status: str, exc: Exception) -> str:
+    detail = mask_secret(str(exc)).strip()
+    if status == "timeout":
+        return f"Сервер не ответил на запрос метрик за {NODE_METRICS_NODE_TIMEOUT_SECONDS}s"
+    if status == "ssh_error":
+        return f"SSH ошибка при сборе метрик{': ' + detail if detail else ''}"
+    return f"Сервер недоступен при сборе метрик{': ' + detail if detail else ''}"
+
+
+def log_node_metrics_failure(node: VpsNode, exc: Exception, elapsed_seconds: float) -> None:
+    logger.warning(
+        "node metrics failed node_id=%s node_name=%s host=%s operation=collect_metrics status=%s duration_ms=%s error=%s",
+        node.id,
+        node.name,
+        node.ip_address,
+        classify_node_metric_error(exc),
+        round(elapsed_seconds * 1000),
+        mask_secret(str(exc)),
+    )
 
 
 async def run_node_metric_commands(node: VpsNode) -> dict[str, str]:
@@ -79,6 +169,7 @@ async def run_node_metric_commands(node: VpsNode) -> dict[str, str]:
     async with asyncssh.connect(
         node.ip_address,
         **options,
+        timeout=NODE_METRICS_CONNECT_TIMEOUT_SECONDS,
     ) as conn:
         for key, command in {
             "cpu": CPU_SAMPLE_COMMAND,
@@ -87,7 +178,10 @@ async def run_node_metric_commands(node: VpsNode) -> dict[str, str]:
             "network": NETWORK_COMMAND,
             "xray": XRAY_STATS_COMMAND,
         }.items():
-            result = await conn.run(command, check=False)
+            try:
+                result = await conn.run(command, check=False, timeout=NODE_METRICS_COMMAND_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError as exc:
+                raise NodeMetricCommandTimeout(key) from exc
             if result.exit_status != 0:
                 outputs[key] = ""
                 outputs[f"{key}_error"] = result.stderr or f"exit_code={result.exit_status}"
@@ -103,6 +197,8 @@ def base_metric_row(db: Session, node: VpsNode, period: str = "all") -> dict[str
         "name": node.name,
         "ip_address": node.ip_address,
         "status": node.status,
+        "metrics_status": "skipped" if node.status != NodeStatus.online.value else "pending",
+        "metrics_error": None,
         "cpu_percent": None,
         "ram_used_bytes": None,
         "ram_total_bytes": None,

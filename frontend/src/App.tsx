@@ -480,6 +480,7 @@ function AdminPages({
   const [dashboard, setDashboard] = useState<DashboardStats | null>(null);
   const [nodes, setNodes] = useState<NodeRead[]>([]);
   const [nodeMetrics, setNodeMetrics] = useState<NodeMetric[]>([]);
+  const [metricsNotice, setMetricsNotice] = useState("");
   const [dashboardTrafficPeriod, setDashboardTrafficPeriod] = useState("all");
   const [users, setUsers] = useState<VpnUser[]>([]);
   const [trafficRows, setTrafficRows] = useState<TrafficUser[]>([]);
@@ -511,16 +512,30 @@ function AdminPages({
     onNotice(formatApplyStatusMessage(base, applyStatus));
   }, [onNotice]);
 
+  const refreshMetrics = useCallback(async () => {
+    try {
+      const metricList = await api.nodeMetrics(dashboardTrafficPeriod);
+      setNodeMetrics(metricList);
+      setMetricsNotice("");
+      return metricList;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Не удалось обновить метрики серверов";
+      setMetricsNotice(`${message} Показываем последние сохранённые данные.`);
+      onNotice("Не удалось обновить метрики серверов. Остальные данные сохранены.");
+      return null;
+    }
+  }, [dashboardTrafficPeriod, onNotice]);
+
   useEffect(() => {
     setNotice("");
   }, [page]);
 
   const refresh = useCallback(async () => {
+    const metricPromise = refreshMetrics();
     try {
-      const [stats, nodeList, metricList, userList, departmentList, profileList, auditList, trafficList] = await Promise.all([
+      const [stats, nodeList, userList, departmentList, profileList, auditList, trafficList] = await Promise.all([
         api.dashboard(),
         api.nodes(),
-        api.nodeMetrics(dashboardTrafficPeriod),
         api.users(),
         api.departments(),
         api.profiles(),
@@ -529,7 +544,6 @@ function AdminPages({
       ]);
       setDashboard(stats);
       setNodes(nodeList);
-      setNodeMetrics(metricList);
       setUsers(visibleUsers(userList));
       setTrafficRows(trafficList);
       setDepartments(departmentList);
@@ -541,7 +555,8 @@ function AdminPages({
     } catch (error) {
       onNotice(error instanceof Error ? error.message : "API недоступен");
     }
-  }, [onNotice, dashboardTrafficPeriod]);
+    await metricPromise;
+  }, [onNotice, refreshMetrics]);
 
   useEffect(() => {
     void refresh();
@@ -549,12 +564,13 @@ function AdminPages({
 
   const refreshVisibleData = useCallback(async (targetPage: PageKey) => {
     if (targetPage === "dashboard") {
-      const [stats, metricList, userList] = await Promise.all([api.dashboard(), api.nodeMetrics(dashboardTrafficPeriod), api.users()]);
+      const metricPromise = refreshMetrics();
+      const [stats, userList] = await Promise.all([api.dashboard(), api.users()]);
       const visible = visibleUsers(userList);
       setDashboard(stats);
-      setNodeMetrics(metricList);
       setUsers(visible);
       setSelectedUser((current) => visible.find((user) => user.id === current?.id) || current);
+      await metricPromise;
       return;
     }
     if (targetPage === "users" || targetPage === "user-detail") {
@@ -568,12 +584,13 @@ function AdminPages({
       return;
     }
     if (targetPage === "servers" || targetPage === "server-detail" || targetPage === "install-xray") {
-      const [nodeList, metricList] = await Promise.all([api.nodes(), api.nodeMetrics(dashboardTrafficPeriod)]);
+      const metricPromise = refreshMetrics();
+      const nodeList = await api.nodes();
       setNodes(nodeList);
-      setNodeMetrics(metricList);
       setSelectedNode((current) => nodeList.find((node) => node.id === current?.id) || current);
+      await metricPromise;
     }
-  }, [dashboardTrafficPeriod]);
+  }, [refreshMetrics]);
 
   useEffect(() => {
     let stopped = false;
@@ -816,7 +833,7 @@ function AdminPages({
   }
 
   const pages = {
-    dashboard: <DashboardPage stats={dashboard} nodeMetrics={nodeMetrics} users={users} setPage={setPage} onRefresh={() => refreshVisibleData("dashboard")} trafficPeriod={dashboardTrafficPeriod} onTrafficPeriodChange={setDashboardTrafficPeriod} />,
+    dashboard: <DashboardPage stats={dashboard} nodeMetrics={nodeMetrics} metricsNotice={metricsNotice} users={users} setPage={setPage} onRefresh={() => refreshVisibleData("dashboard")} trafficPeriod={dashboardTrafficPeriod} onTrafficPeriodChange={setDashboardTrafficPeriod} />,
     servers: (
       <ServersPage
         nodes={nodes}
@@ -996,6 +1013,7 @@ function AdminPages({
 function DashboardPage({
   stats,
   nodeMetrics,
+  metricsNotice,
   users,
   setPage,
   onRefresh,
@@ -1004,6 +1022,7 @@ function DashboardPage({
 }: {
   stats: DashboardStats | null;
   nodeMetrics: NodeMetric[];
+  metricsNotice: string;
   users: VpnUser[];
   setPage: (page: PageKey) => void;
   onRefresh: () => Promise<void>;
@@ -1017,6 +1036,7 @@ function DashboardPage({
     ["Пользователи", stats?.users_total ?? 0]
   ];
   const systemTraffic = systemTrafficSummary(nodeMetrics);
+  const metricWarning = metricsNotice || nodeMetricWarning(nodeMetrics);
   return (
     <div className="grid gap-5">
       <PageHeader
@@ -1049,6 +1069,7 @@ function DashboardPage({
           </div>
         </CardHeader>
         <CardContent className="max-h-[620px] overflow-auto">
+          {metricWarning ? <div className="mb-3"><Message tone="warning" text={metricWarning} /></div> : null}
           {!nodeMetrics.length ? (
             <EmptyPanel title="Серверы пока не добавлены" text="Добавьте VPS, чтобы увидеть метрики CPU, RAM, диска и traffic." />
           ) : (
@@ -1124,7 +1145,16 @@ function systemTrafficSummary(metrics: NodeMetric[]) {
   };
 }
 
+function nodeMetricWarning(metrics: NodeMetric[]) {
+  const unavailable = metrics.filter((metric) => ["timeout", "ssh_error", "unreachable"].includes(metric.metrics_status));
+  if (!unavailable.length) return "";
+  const names = unavailable.slice(0, 3).map((metric) => metric.name).join(", ");
+  const suffix = unavailable.length > 3 ? ` и ещё ${unavailable.length - 3}` : "";
+  return `Не удалось обновить метрики по ${unavailable.length} сервер${unavailable.length === 1 ? "у" : "ам"}: ${names}${suffix}. Остальная панель работает.`;
+}
+
 function ServerMetricRow({ metric }: { metric: NodeMetric }) {
+  const displayStatus = ["timeout", "ssh_error", "unreachable"].includes(metric.metrics_status) ? metric.metrics_status : metric.status;
   return (
     <div className="rounded-md border border-akfa-line bg-white px-4 py-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1132,7 +1162,7 @@ function ServerMetricRow({ metric }: { metric: NodeMetric }) {
           <div className="truncate font-semibold">{metric.name}</div>
           <div className="font-mono text-xs text-akfa-muted">{metric.ip_address}</div>
         </div>
-        <StatusBadge value={metric.status} />
+        <StatusBadge value={displayStatus} />
       </div>
       <div className="mt-3 grid gap-3 lg:grid-cols-3">
         <MetricBar label="CPU" value={metric.cpu_percent} />
@@ -1170,7 +1200,8 @@ function ServerMetricRow({ metric }: { metric: NodeMetric }) {
           </div>
         </div>
       </div>
-      {metric.errors.length ? <div className="mt-2 text-xs text-akfa-red">{metric.errors.join("; ")}</div> : null}
+      {metric.metrics_error ? <div className="mt-2 text-xs text-akfa-red">{metric.metrics_error}</div> : null}
+      {metric.errors.length && !metric.metrics_error ? <div className="mt-2 text-xs text-akfa-red">{metric.errors.join("; ")}</div> : null}
     </div>
   );
 }
@@ -4167,6 +4198,9 @@ function translateStatus(value: string) {
     checking: "проверка",
     online: "онлайн",
     offline: "офлайн",
+    timeout: "timeout",
+    unreachable: "недоступен",
+    ssh_error: "SSH ошибка",
     installing: "установка",
     failed: "ошибка",
     maintenance: "обслуживание"

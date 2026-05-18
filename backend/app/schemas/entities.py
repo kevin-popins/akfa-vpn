@@ -188,6 +188,8 @@ class NodeMetricsRead(BaseModel):
     name: str
     ip_address: str
     status: str
+    metrics_status: str = "pending"
+    metrics_error: str | None = None
     cpu_percent: float | None = None
     ram_used_bytes: int | None = None
     ram_total_bytes: int | None = None

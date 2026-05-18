@@ -1,5 +1,8 @@
 import json
+import asyncio
+import logging
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -7,13 +10,18 @@ import asyncssh
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.security import mask_secret
 from app.models import DeviceStatus, NodeStatus, TrafficSnapshot, UserNodeTraffic, UserStatus, VpsNode, VpnUser, VpnUserDevice
 from app.services.ssh_host_keys import ssh_connection_options
+
+logger = logging.getLogger(__name__)
 
 USER_TRAFFIC_RE = re.compile(r"user>>>([^>]+)>>>traffic>>>(uplink|downlink)")
 DEVICE_EMAIL_RE = re.compile(r"^akfa_user_(\d+)_device_(\d+)$")
 XRAY_STATS_COMMAND = "/usr/local/bin/xray api statsquery --server=127.0.0.1:10085"
 ONLINE_WINDOW_SECONDS = 180
+XRAY_STATS_CONNECT_TIMEOUT_SECONDS = 5
+XRAY_STATS_COMMAND_TIMEOUT_SECONDS = 8
 
 
 class StatsCollectionError(RuntimeError):
@@ -60,11 +68,25 @@ def select_traffic_nodes(nodes: list[VpsNode], selected_node_id: int | None = No
 
 async def run_xray_statsquery(node: VpsNode) -> dict[str, Any]:
     _, options = ssh_connection_options(node)
-    async with asyncssh.connect(
-        node.ip_address,
-        **options,
-    ) as conn:
-        result = await conn.run(XRAY_STATS_COMMAND, check=False)
+    started = time.monotonic()
+    try:
+        async with asyncssh.connect(
+            node.ip_address,
+            **options,
+            timeout=XRAY_STATS_CONNECT_TIMEOUT_SECONDS,
+        ) as conn:
+            result = await conn.run(XRAY_STATS_COMMAND, check=False, timeout=XRAY_STATS_COMMAND_TIMEOUT_SECONDS)
+    except Exception as exc:
+        logger.warning(
+            "xray stats failed node_id=%s node_name=%s host=%s operation=xray_statsquery duration_ms=%s error_type=%s error=%s",
+            node.id,
+            node.name,
+            node.ip_address,
+            round((time.monotonic() - started) * 1000),
+            "timeout" if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) else exc.__class__.__name__,
+            mask_secret(str(exc)),
+        )
+        raise
     return {
         "node_id": node.id,
         "command": XRAY_STATS_COMMAND,

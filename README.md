@@ -578,6 +578,18 @@ Job логирует этапы:
 
 Если SSH-команда получает timeout, backend закрывает remote channel и не оставляет долгий процесс бесконтрольно висеть. При apt/dpkg lock backend показывает понятную ошибку, а lock-файлы не удаляются вслепую.
 
+## Graceful degradation для недоступных nodes
+
+Runtime-опрос удалённых node не должен блокировать панель:
+
+- `/admin/nodes/metrics?period=all` возвращает частичный ответ, даже если один VPS не отвечает;
+- SSH connect/read для метрик имеет короткие timeout и общий upper bound на одну node;
+- недоступная node остаётся отдельной строкой с `metrics_status` (`timeout`, `ssh_error`, `unreachable`) и `metrics_error`;
+- сохранённые traffic counters из БД продолжают отображаться как last known data;
+- ошибка конкретной node логируется с `node_id`, `node_name`, `host`, операцией, типом ошибки и временем выполнения.
+
+Frontend не переводит весь интерфейс в maintenance mode из-за сбоя `/admin/nodes/metrics`: серверы, пользователи, dashboard и traffic overview остаются на экране, а UI показывает предупреждение по проблемной node.
+
 ## Apply-config
 
 Apply-config:
@@ -1220,6 +1232,8 @@ POST   /admin/nodes/{id}/users/remove
 POST   /admin/nodes/{id}/replace
 ```
 
+`/admin/nodes/metrics` всегда отдаёт массив строк по node. Для проблемной node поля runtime-метрик могут быть `null`, но строка содержит сохранённый трафик из БД, `metrics_status` и `metrics_error`.
+
 ### Users and devices
 
 ```text
@@ -1652,7 +1666,7 @@ sudo journalctl -u akfa-backend-watchdog.service -n 100 --no-pager
 
 Install сначала активирует только HTTP templates. HTTPS templates включаются только после успешного `certbot certonly --webroot` и проверки наличия `/etc/letsencrypt/live/CERT_NAME/fullchain.pem`. По умолчанию `CERT_NAME` равен `PANEL_DOMAIN`. Если certbot временно занят или не смог выпустить сертификат, install оставляет nginx в валидном HTTP-only режиме и печатает команду повторного выпуска SSL.
 
-Если frontend загрузился, но backend API недоступен, React UI показывает собственный экран:
+Если frontend загрузился, но backend API недоступен на базовой проверке `/auth/me`, React UI показывает собственный экран:
 
 ```text
 Панель временно перезапускается
@@ -1661,6 +1675,8 @@ Install сначала активирует только HTTP templates. HTTPS t
 ```
 
 HTTP `401/403` остаются обычной auth-логикой и не считаются maintenance.
+
+Сбой отдельного admin endpoint, например timeout `/admin/nodes/metrics`, не считается перезапуском панели: UI сохраняет последние данные и показывает предупреждение о частично недоступных метриках.
 
 ## Docs Downloads
 

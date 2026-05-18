@@ -17,6 +17,9 @@ export function StatusBadge({ value }: { value: string }) {
     checking: "Проверка",
     online: "Онлайн",
     offline: "Не в сети",
+    timeout: "Timeout",
+    unreachable: "Недоступен",
+    ssh_error: "SSH ошибка",
     installing: "Установка",
     failed: "Ошибка",
     maintenance: "Обслуживание",
@@ -33,7 +36,7 @@ export function StatusBadge({ value }: { value: string }) {
   const tone =
     value === "active" || value === "online"
       ? "border-green-200 bg-green-50 text-akfa-green"
-      : value === "failed" || value === "deleted" || value === "traffic_limited"
+      : value === "failed" || value === "deleted" || value === "traffic_limited" || value === "timeout" || value === "unreachable" || value === "ssh_error"
         ? "border-red-200 bg-red-50 text-akfa-red"
         : value === "offline"
           ? "border-zinc-200 bg-zinc-50 text-zinc-600"
